@@ -69,7 +69,7 @@ bool any_lit(const BitCanvas &c, int x0, int y0, int x1, int y1) {
 TEST(settings_menu_every_row_fits_19_glyphs_at_every_value) {
     const Config_body body = defaults();
     // A row: the label from column 1, one blank at least, the value ending on column 18.
-    // loop: NOT-WORTH — host test, 27 items
+    // loop: NOT-WORTH — host test, 29 items
     for (const SetItem &it : kItems) {
         const int label = static_cast<int>(std::strlen(it.label));
         CHECK(kLabelCol + label <= kValueEndCol + 1);
@@ -101,17 +101,17 @@ TEST(settings_menu_every_row_fits_19_glyphs_at_every_value) {
 }
 
 TEST(settings_menu_groups_in_order_with_their_items) {
-    const char *const want[][11] = {
+    const char *const want[][12] = {
         {"Haptics/trigger", "Vibration L", "Vibration R", "Trig. effect", "AutoHap", "AutoHap gain", "Auto filter"},
         {"Audio", "Spk volume", "Spk boost", "Lock volume", "Audio out", "Built-in mic", "Mic used", "Mic level",
-         "Echo cancel", "Audio buffer"},
-        {"Connection", "Controller", "Poll rate", "Disconnect", "Idle time"},
+         "Echo cancel", "Audio buffer", "Audio pkt"},
+        {"Connection", "Controller", "Poll rate", "Disconnect", "Idle time", "Drop on dock"},
         {"Screen & lights", "Screen dim", "Screen off", "Wake on input", "Status LED"},
         {"PC sleep", "Turn off ctrl", "PS wakes PC"},
         {"Reset", "Reset to defaults", "Wipe all slots"},
     };
     CHECK_EQ(kNumGroups, 6);
-    CHECK_EQ(kNumItems, 27);
+    CHECK_EQ(kNumItems, 29);
     // loop: NOT-WORTH — host test
     for (int g = 0; g < kNumGroups; g++) {
         CHECK(std::strcmp(kGroups[g].name, want[g][0]) == 0);
@@ -368,4 +368,31 @@ TEST(settings_menu_save_takes_every_items_field_in_the_new_order) {
     CHECK_EQ(c.screen_brightness, 1);
     CHECK_EQ(c.narrator_voice, 4);
     CHECK(power != POWER_FLAGS_DEFAULT);  // the power flags changed on the copy only
+}
+
+// b4f7529 (left and right grip strengths set separately, review standards
+// N9): "Vibration L" moves haptics_gain only and "Vibration R"
+// haptics_gain_right only, each in 0.5 steps within 1.0..6.0.
+TEST(settings_menu_grip_strengths_move_one_grip_each) {
+    int left = -1, right = -1;
+    // loop: NOT-WORTH — host test, every settings item
+    for (int i = 0; i < kNumItems; i++) {
+        if (kItems[i].kind != SK_NUM) continue;  // SK_POWER's off is a bit mask
+        if (kItems[i].off == offsetof(Config_body, haptics_gain)) left = i;
+        if (kItems[i].off == offsetof(Config_body, haptics_gain_right)) right = i;
+    }
+    CHECK(left >= 0 && right >= 0 && left != right);
+    Config_body b = defaults();
+    b.haptics_gain = 2.0f;
+    b.haptics_gain_right = 3.0f;
+    uint8_t power = 0;
+    adjust(kItems[left], b, power, +1);
+    CHECK(b.haptics_gain > 2.49f && b.haptics_gain < 2.51f);
+    CHECK(b.haptics_gain_right > 2.99f && b.haptics_gain_right < 3.01f);
+    adjust(kItems[right], b, power, -1);
+    CHECK(b.haptics_gain > 2.49f && b.haptics_gain < 2.51f);
+    CHECK(b.haptics_gain_right > 2.49f && b.haptics_gain_right < 2.51f);
+    b.haptics_gain_right = 6.0f;
+    adjust(kItems[right], b, power, +1);  // the top stays the top
+    CHECK(b.haptics_gain_right > 5.99f && b.haptics_gain_right < 6.01f);
 }

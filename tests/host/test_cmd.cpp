@@ -35,14 +35,14 @@ void settle() {  // let a deferred command run (reboot/BOOTSEL wait 50 ms)
 }
 }  // namespace
 
-TEST(cmd_identity_reports_protocol_1_20) {
+TEST(cmd_identity_reports_protocol_1_22) {
     fresh();
     uint8_t id[47]{};
     CHECK_EQ(pico_cmd_get(PICO_CMD_IDENTITY, id, sizeof(id)), 47);
     CHECK(std::memcmp(id, "DS5O", 4) == 0);
     CHECK_EQ(id[4], 1);
-    CHECK_EQ(id[5], 20);
-    CHECK_EQ(id[6], 51);
+    CHECK_EQ(id[5], 22);
+    CHECK_EQ(id[6], 53);
     CHECK(id[46] & 0x02);  // the 1.13 config fields
     CHECK(id[46] & 0x04);  // the 1.14 PC sleep options
     CHECK(id[46] & 0x08);  // the 1.15 timed grip test
@@ -151,13 +151,14 @@ TEST(cmd_config_get_layouts) {
     CHECK_EQ(r[42], 6);
     CHECK_EQ(r[47], 4);
     CHECK_EQ(pico_cmd_get(0xF7, r, 62), sizeof(Config_body));
+    CHECK_EQ(pico_cmd_get(0xF7, r, 51), 51);                            // what 1.17..1.21 apps ask for: no 1.22 fields
     CHECK_EQ(pico_cmd_get(0xF7, r, 50), 50);                            // what 1.16 apps ask for: no echo cancellation
     CHECK_EQ(pico_cmd_get(0xF7, r, 49), 49);                            // what 1.13..1.15 apps ask for: no mic level
     CHECK_EQ(pico_cmd_get(0xF7, r, kConfigBodyV16), kConfigBodyV16);  // what apps before 1.13 ask for
     CHECK_EQ(pico_cmd_get(0xF7, r, 38), 38);                            // the narrator read
 }
 
-// The app's config write (0x01) carries the whole 51-byte body.
+// The app's config write (0x01) carries the whole 53-byte body.
 TEST(cmd_config_set_takes_the_whole_body) {
     fresh();
     Config_body b = get_config();
@@ -219,6 +220,52 @@ TEST(cmd_config_set_echo_cancel_both_ways) {
     CHECK_EQ(last_result(), CMD_RESULT_OK);
     CHECK_EQ(get_config().mic_level, 12);
     CHECK_EQ(get_config().mic_echo_cancel, 0);
+}
+
+// Protocol 1.22: identity [49] bits 4..6 (1000 Hz polling, the audio report
+// choice, the dock disconnect); a 53-byte write sets the two new fields, a
+// 1.17..1.21 app's 51-byte write leaves them alone, and 0xFF (a body saved
+// by older firmware) takes the defaults.
+TEST(cmd_config_1_22_fields) {
+    fresh();
+    uint8_t id[63]{};
+    CHECK_EQ(pico_cmd_get(PICO_CMD_IDENTITY, id, 50), 50);
+    CHECK_EQ(id[49] & 0x70, 0x70);
+    CHECK_EQ(get_config().packet_mode, 0);         // the packed 0x39
+    CHECK_EQ(get_config().disconnect_on_dock, 0);  // off
+    Config_body b = get_config();
+    b.packet_mode = 1;
+    b.disconnect_on_dock = 1;
+    b.polling_rate_mode = 3;
+    uint8_t msg[1 + sizeof(Config_body)];
+    msg[0] = 0x01;
+    std::memcpy(msg + 1, &b, sizeof(b));
+    pico_cmd_set(PICO_CMD_SET, msg, sizeof(msg));
+    CHECK_EQ(last_result(), CMD_RESULT_OK);
+    CHECK_EQ(get_config().packet_mode, 1);
+    CHECK_EQ(get_config().disconnect_on_dock, 1);
+    CHECK_EQ(get_config().polling_rate_mode, 3);  // 1000 Hz is valid
+    uint8_t r[63]{};
+    CHECK_EQ(pico_cmd_get(0xF7, r, sizeof(Config_body)), sizeof(Config_body));
+    CHECK_EQ(r[51], 1);
+    CHECK_EQ(r[52], 1);
+    b.packet_mode = 0;
+    b.disconnect_on_dock = 0;
+    b.lock_volume = 1;
+    std::memcpy(msg + 1, &b, sizeof(b));
+    pico_cmd_set(PICO_CMD_SET, msg, 1 + 51);  // a 1.17..1.21 app's body
+    CHECK_EQ(last_result(), CMD_RESULT_OK);
+    CHECK_EQ(get_config().lock_volume, 1);
+    CHECK_EQ(get_config().packet_mode, 1);
+    CHECK_EQ(get_config().disconnect_on_dock, 1);
+    b.packet_mode = 0xFF;
+    b.disconnect_on_dock = 0xFF;
+    b.polling_rate_mode = 4;
+    std::memcpy(msg + 1, &b, sizeof(b));
+    pico_cmd_set(PICO_CMD_SET, msg, sizeof(msg));
+    CHECK_EQ(get_config().packet_mode, 0);
+    CHECK_EQ(get_config().disconnect_on_dock, 0);
+    CHECK_EQ(get_config().polling_rate_mode, 1);  // out of range: 500 Hz
 }
 
 TEST(cmd_fc_timings_layout_and_reset) {
@@ -557,12 +604,54 @@ TEST(cmd_extra_remap_failed_save_is_failed_not_invalid) {
     const uint8_t set[] = {0x13, 'R', 'X', 1, kRemapExtraSelf, kRemapExtraSelf, kRemapExtraSelf, kRemapExtraSelf, 0};
     g_fake_flash_fail = true;
     pico_cmd_set(PICO_CMD_SET, set, sizeof(set));
+    settle();
     CHECK_EQ(last_result(), CMD_RESULT_FAILED);
     g_fake_flash_fail = false;
     pico_cmd_set(PICO_CMD_SET, set, sizeof(set));
+    settle();
     CHECK_EQ(last_result(), CMD_RESULT_OK);
     const uint8_t bad[] = {0x13, 'R', 'X', 1, 16, 0, 0, 0, 0};
     pico_cmd_set(PICO_CMD_SET, bad, sizeof(bad));
+    settle();
+    CHECK_EQ(last_result(), CMD_RESULT_INVALID);
+}
+
+// Review S1: the SETs that save to flash (0x0D, 0x10, a saved 0x13 / 0x14)
+// never erase a sector inside the USB control callback. The SET answers
+// PENDING with nothing applied or written; cmd_task() (the main loop) runs it.
+// The RAM-only ones (0x11, a temporary 0x13 / 0x14) still answer at once.
+TEST(cmd_flash_saves_run_from_cmd_task_not_the_usb_callback) {
+    fresh();
+    const uint16_t rev = remap_revision();
+    uint8_t set[4 + kRemapCount] = {0x10, 'R', 'M', kRemapProtoVer};
+    for (int i = 0; i < kRemapCount; i++) set[4 + i] = (uint8_t) (kRemapCount - 1 - i);
+    pico_cmd_set(PICO_CMD_SET, set, sizeof(set));
+    CHECK_EQ(last_result(), CMD_RESULT_PENDING);
+    CHECK_EQ(remap_revision(), rev);  // nothing applied (or saved) yet
+    const uint8_t busy[] = {0x15};
+    pico_cmd_set(PICO_CMD_SET, busy, sizeof(busy));
+    CHECK_EQ(last_result(), CMD_RESULT_BUSY);  // another SET meanwhile is BUSY; the save still runs
+    settle();
+    CHECK_EQ(last_result(), CMD_RESULT_OK);
+    CHECK(remap_revision() != rev);
+    remap_load();  // it is in flash
+    uint8_t got[kRemapCount];
+    remap_get(got);
+    CHECK_EQ(got[0], kRemapCount - 1);
+
+    const uint8_t extra_tmp[] = {0x13, 'R', 'X', 1, kRemapExtraSelf, kRemapExtraSelf, kRemapExtraSelf, kRemapExtraSelf, 1};
+    pico_cmd_set(PICO_CMD_SET, extra_tmp, sizeof(extra_tmp));
+    CHECK_EQ(last_result(), CMD_RESULT_OK);  // RAM only: at once
+    const uint8_t extra_saved[] = {0x13, 'R', 'X', 1, kRemapExtraSelf, kRemapExtraSelf, kRemapExtraSelf, kRemapExtraSelf, 0};
+    pico_cmd_set(PICO_CMD_SET, extra_saved, sizeof(extra_saved));
+    CHECK_EQ(last_result(), CMD_RESULT_PENDING);
+    settle();
+    CHECK_EQ(last_result(), CMD_RESULT_OK);
+
+    const uint8_t calib_bad[] = {0x0D, 'C', 'L'};  // too short: INVALID, reported from cmd_task
+    pico_cmd_set(PICO_CMD_SET, calib_bad, sizeof(calib_bad));
+    CHECK_EQ(last_result(), CMD_RESULT_PENDING);
+    settle();
     CHECK_EQ(last_result(), CMD_RESULT_INVALID);
 }
 
@@ -571,7 +660,7 @@ TEST(cmd_extra_remap_failed_save_is_failed_not_invalid) {
 TEST(cmd_fd_mic_level_section) {
     fresh();
     uint8_t r[63]{};
-    CHECK_EQ(pico_cmd_get(0xFD, r, 63), 50);
+    CHECK_EQ(pico_cmd_get(0xFD, r, 63), 62);
     uint32_t drops = 0;
     std::memcpy(&drops, r + 44, 4);
     CHECK_EQ(drops, 0x01020304u);  // fakes.cpp
@@ -579,6 +668,36 @@ TEST(cmd_fd_mic_level_section) {
     CHECK_EQ(r[49], 6);
     uint8_t old[44]{};
     CHECK_EQ(pico_cmd_get(0xFD, old, 44), 44);
+}
+
+// 0xFD section 4: output reports the full Bluetooth queue dropped (they used
+// to be counted as sent). Hosts asking for 50 bytes get what they did before.
+TEST(cmd_fd_bt_send_drops_section) {
+    fresh();
+    uint8_t r[63]{};
+    CHECK_EQ(pico_cmd_get(0xFD, r, 63), 62);
+    uint32_t drops = 0;
+    std::memcpy(&drops, r + 50, 4);
+    CHECK_EQ(drops, 0x05060708u);  // fakes.cpp
+    uint8_t old[50]{};
+    CHECK_EQ(pico_cmd_get(0xFD, old, 50), 50);
+}
+
+// 0xFD section 5: mic and USB speaker audio lost before Bluetooth, u16 each
+// (the low 16 bits of the counts). Hosts asking for 54 bytes get what they did before.
+TEST(cmd_fd_audio_lost_section) {
+    fresh();
+    uint8_t r[63]{};
+    CHECK_EQ(pico_cmd_get(0xFD, r, 63), 62);
+    uint16_t v[4]{};
+    std::memcpy(v, r + 54, 8);
+    CHECK_EQ(v[0], 0x1234);  // fakes.cpp: 0x11234, low 16 bits
+    CHECK_EQ(v[1], 0x5678);
+    CHECK_EQ(v[2], 0x9ABC);
+    CHECK_EQ(v[3], 0xDEF0);
+    CHECK_EQ(r[62], 0);
+    uint8_t old[54]{};
+    CHECK_EQ(pico_cmd_get(0xFD, old, 54), 54);
 }
 
 // Cache pass batch 5: the measured clock (frequency_count_khz busy-waits a few
@@ -633,4 +752,27 @@ TEST(cmd_diag_uptime_survives_the_32_bit_wrap) {
     std::memcpy(&up, r, 4);
     CHECK_EQ(up, 3u * 3600);
     g_fake_time_us = saved;
+}
+
+// Review fw-usb-bt N7: on the game-facing HID interface (release builds) the
+// functions that unpair controllers or erase settings are refused; the
+// vendor interface (the app) still runs them; other functions pass.
+TEST(cmd_hid_path_refuses_unpair_and_reset) {
+    fresh();
+    const uint8_t cmds[][2] = {{0x05, 1}, {0x06, 0}, {0x09, 0}};
+    for (const auto &c : cmds) {
+        pico_cmd_set_hid(PICO_CMD_SET, c, sizeof(c));
+        CHECK_EQ(last_result(), CMD_RESULT_INVALID);
+        settle();
+        CHECK_EQ(last_result(), CMD_RESULT_INVALID);  // nothing was deferred
+        pico_cmd_set(PICO_CMD_SET, c, sizeof(c));     // the vendor interface
+        CHECK_EQ(last_result(), CMD_RESULT_PENDING);
+        settle();
+        CHECK_EQ(last_result(), CMD_RESULT_OK);
+    }
+    const int reboots = g_fake_reboots;
+    const uint8_t reboot[] = {0x07};
+    pico_cmd_set_hid(PICO_CMD_SET, reboot, sizeof(reboot));
+    settle();
+    CHECK_EQ(g_fake_reboots, reboots + 1);
 }

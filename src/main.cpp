@@ -5,6 +5,7 @@
 #include <cstdio>
 #include "bsp/board_api.h"
 #include "bt.h"
+#include "bt_policy.h"
 #include "core0_ram.h"
 #include "utils.h"
 #include "resample.h"
@@ -32,9 +33,13 @@
 #include "dse.h"
 #include "fw_report.h"
 #include "usb_power.h"
+#include "board_facts.h"
+#include "display_table.h"
+#include "fw_identity.h"
+#include "radio_boot.h"
+#include "oled_toast.h"
+#include "pico/binary_info.h"
 
-// Pico SDK speciifically for waiting on conditions
-#include "pico/critical_section.h"
 #include "hardware/sync.h"
 #include "pico/multicore.h"
 
@@ -46,7 +51,6 @@ static uint8_t scale_rumble(uint8_t v, float gain) {
     return (uint8_t) (s > 255 ? 255 : s);
 }
 
-uint8_t packetCounter = 0;
 bool spk_active = false;
 extern bool g_lightbar_override; // oled.cpp: OLED owns the lightbar
 
@@ -85,14 +89,11 @@ void bt_31_mic_prefix(uint8_t out[6]) {
 //                     (valid_flag0 bits 2 & 3) — i.e. the host actually
 //                     told us "apply trigger FFB"
 //   out02_to_bt     - 0x02 reports that we forwarded to the controller as
-//                     a BT 0x31 sub-0x10 packet (gated off when speaker is
-//                     active; audio.cpp's 0x36 path carries state then)
-//   out02_trig_folded - of the trig_allow reports, how many arrived while the
-//                     speaker stream was active and were therefore NOT sent as
-//                     a standalone 0x31 — their trigger FFB was folded into the
-//                     0x36 audio frames via state[]. So trig_allow == to_bt's
-//                     trigger share + this, proving the "missing" forwards
-//                     (issue #6) aren't drops. Surfaced on the Diag screen.
+//                     a BT 0x31 sub-0x10 packet (all of them, unless the
+//                     Bluetooth output queue was full)
+//   out02_trig_folded - trigger reports folded into the audio reports
+//                     instead of a 0x31. Stays 0: since upstream 8eb8612 the
+//                     0x39 audio report carries no state, so nothing is folded.
 // Surfaced on the OLED Diagnostics screen.
 volatile uint32_t g_host_out02_total = 0;
 volatile uint32_t g_host_out02_trig_allow = 0;
@@ -114,8 +115,11 @@ uint8_t interrupt_in_data[63] = {
     0x53, 0x9f, 0x28, 0x35, 0xa5, 0xa8, 0x0c, 0x8b
 };
 
-critical_section_t report_cs;
-volatile bool report_dirty = false;
+// Real-time polling: a fresh input report waits for interrupt_loop. Written
+// by on_bt_data (inside cyw43_arch_poll) and read by interrupt_loop, both on
+// core0's main loop (pico_cyw43_arch_poll: no IRQ or core1 access), so no
+// lock (upstream e79c06a dropped report_cs the same way).
+bool report_dirty = false;
 
 void CORE0_RAM_FUNC(interrupt_loop)() {
     // OLED Edition: hold PS + Mute for 2 seconds to soft-reboot the dongle.
@@ -157,14 +161,11 @@ void CORE0_RAM_FUNC(interrupt_loop)() {
     // Local buffer to hold the report data while we prepare it to send. 
     uint8_t safe_report[63];
 
-
-    critical_section_enter_blocking(&report_cs);
     if (report_dirty) {
         memcpy(safe_report, interrupt_in_data, 63);
         report_dirty = false;
         should_send = true;
     }
-    critical_section_exit(&report_cs);
 
     // Remap the snapshot, not interrupt_in_data (outgoing copy only — see above).
     if (should_send) {
@@ -180,9 +181,7 @@ void CORE0_RAM_FUNC(interrupt_loop)() {
 
             // If the report failed to queue, restore the dirty flag 
             // so we try again on the next loop iteration.
-            critical_section_enter_blocking(&report_cs);
             report_dirty = true;
-            critical_section_exit(&report_cs);
         }
     }
 }
@@ -194,9 +193,9 @@ void CORE0_RAM_FUNC(on_bt_data)(CHANNEL_TYPE channel, uint8_t *data, uint16_t le
     // bit 0 (and bit 1) is NOT a mic flag, just the report-type indicator;
     // every "mic-tagged" frame turned out to be standard input.
     if (channel == INTERRUPT && len > 1) {
-        if (data[1] == 0x31) g_bt_31_packets++;
+        if (data[1] == 0x31) g_bt_31_packets = g_bt_31_packets + 1;
         else {
-            g_bt_other_packets++;
+            g_bt_other_packets = g_bt_other_packets + 1;
             g_last_other_id = data[1];
             g_other_id_or = (uint8_t)(g_other_id_or | data[1]);
             // loop: HOT-PATH-OK — ≤ 8 bytes per non-0x31 BT frame (debug counters)
@@ -229,7 +228,7 @@ void CORE0_RAM_FUNC(on_bt_data)(CHANNEL_TYPE channel, uint8_t *data, uint16_t le
     }
 
     // Mic-in tap (TEST): once the dongle asserts the mic-enable bit in the
-    // outgoing 0x36 audio report (pkt[4] bit 0, see audio.cpp — awalol
+    // outgoing 0x39 audio report (pkt[4] bit 0, see audio.cpp — awalol
     // confirmed this is the key), the DS5 streams its mic as a 71-byte Opus
     // packet at data+4 of a 0x31 report with bit 1 of data[2] set. Route those
     // to the mic decoder instead of treating them as a standard input report.
@@ -253,6 +252,17 @@ void CORE0_RAM_FUNC(on_bt_data)(CHANNEL_TYPE channel, uint8_t *data, uint16_t le
             set_headset(data[56] & 1);
         }
 
+        // "Disconnect when docked" (protocol 1.22): byte 53 (data[56]) bit 6
+        // is DockDetect; one disconnect per dock event (src/bt_policy.h).
+        static btpolicy::DockDisconnect dock;
+        if (dock.due((data[3 + btpolicy::kDockByte] & btpolicy::kDockBit) != 0, get_config().disconnect_on_dock)) {
+            // error: LOGGED-OK — printf; false = no link to drop (already going), and the next docked report tries again
+            if (bt_disconnect()) {
+                dock.sent();
+                printf("[BT] Docked: disconnect\n");
+            }
+        }
+
         if (get_config().polling_rate_mode != 2) {
             memcpy(interrupt_in_data, data + 3, 63);
 #if ENABLE_BATT_LED
@@ -261,10 +271,8 @@ void CORE0_RAM_FUNC(on_bt_data)(CHANNEL_TYPE channel, uint8_t *data, uint16_t le
             return;
         }
 
-        critical_section_enter_blocking(&report_cs);
         memcpy(interrupt_in_data, data + 3, 63);
         report_dirty = true;
-        critical_section_exit(&report_cs);
 #if ENABLE_BATT_LED
         battery_led_note_report();
 #endif
@@ -293,7 +301,9 @@ uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t
     }
     const uint16_t n = get_report_impl(itf, report_id, report_type, buffer, reqlen);
     if (report_id < 0xF2) { // don't record our own diagnostic reads
-        const uint32_t i = g_get_count++ % 16;
+        const uint32_t count = g_get_count;  // one load and one store, as ++ did (-Wvolatile)
+        g_get_count = count + 1;
+        const uint32_t i = count % 16;
         g_get_ring[i][0] = report_id;
         g_get_ring[i][1] = n > 255 ? 255 : static_cast<uint8_t>(n);
     }
@@ -376,10 +386,21 @@ static uint16_t get_report_impl(uint8_t itf, uint8_t report_id, hid_report_type_
         return 0;
     }
 
+    // Live reads (upstream 8c647e0, src/dse.h): 0x81 and the Edge profiles
+    // only with a reply the controller sent after the PC's last write; else
+    // the GET goes to the controller and the PC asks again a moment later.
+    // No wait here: the USB request is answered at once.
+    if (dse_is_live_report(report_id) && !dse_live_reply_ready(report_id)) {
+        bt_request_feature(report_id);
+        // error: NOT-WORTH — a 1-byte reply (only the report id) on purpose until the controller's fresh reply is cached (a few ms; the PC asks again); the read is started here
+        return 0;
+    }
+
     // lifetime: NOT-WORTH — per host GET feature report (the PC asks a few times per connect)
     std::vector<uint8_t> feature_data = get_feature_data(report_id, reqlen);
     // error: NOT-WORTH — nothing cached yet: the reply is only the report id, the PC asks again
     if (feature_data.empty()) return 0;
+    if (dse_is_live_report(report_id)) dse_live_reply_taken(report_id);
     // The data after the id, never more than the host asked for: buffer is
     // TinyUSB's control buffer and holds reqlen bytes (a cached reply can be
     // longer than the GET, e.g. a 64-byte report read with a short wLength).
@@ -402,6 +423,7 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
     if (itf == 1) {
         printf("[AUDIO] Set interface Speaker to alternate setting %d\n", alt);
         spk_active = alt;
+        if (alt != 0) audio_speaker_stream_opened();
     }
     if (itf == 2) { // ITF_NUM_AUDIO_STREAMING_IN (microphone)
         printf("[AUDIO] Set interface Microphone to alternate setting %d\n", alt);
@@ -424,7 +446,17 @@ uint8_t g_last_out02_trig[47]{};  // most recent with an Allow*TriggerFFB bit
 
 extern "C" int __real_flash_safe_execute(void (*func)(void *), void *param, uint32_t enter_exit_timeout_ms);
 extern "C" int __wrap_flash_safe_execute(void (*func)(void *), void *param, uint32_t enter_exit_timeout_ms) {
-    g_fse_calls++;
+    g_fse_calls = g_fse_calls + 1;
+    // The flash is smaller than this image was built for (board_facts.h):
+    // saved state would land outside the chip or on top of something else, so
+    // nothing is written (protocol 1.21, 0xEA [10] bit 1). Every flash write
+    // goes through here: ours (flash_sector_write) and BTstack's link keys,
+    // which ignore the result (their RAM copy keeps working until a restart).
+    if (board_saved_state_off()) {
+        // error: SHOWN — 0xEA [10] bit1 (the app says settings can't be saved on this board) and the boot notice on the OLED; each save also reports its own failure (CMD_RESULT_FAILED, "Save FAIL"); counted in g_fse_fail
+        g_fse_fail = g_fse_fail + 1;
+        return PICO_ERROR_NOT_PERMITTED;
+    }
     // Before core1 registers for lockout (boot: BTstack TLV init, *_load
     // repairs) the SDK refuses with PICO_ERROR_NOT_PERMITTED and the write is
     // silently lost. Core1 isn't running audio yet, so masking core0's IRQs is
@@ -437,7 +469,7 @@ extern "C" int __wrap_flash_safe_execute(void (*func)(void *), void *param, uint
     }
     const int rc = __real_flash_safe_execute(func, param, enter_exit_timeout_ms);
     // error: LOGGED-OK — counter g_fse_fail (OLED Diag); the failed write itself is reported by its caller
-    if (rc != PICO_OK) g_fse_fail++;
+    if (rc != PICO_OK) g_fse_fail = g_fse_fail + 1;
     return rc;
 }
 
@@ -473,25 +505,25 @@ static bool host_out02_forward(const uint8_t *buffer, uint16_t bufsize) {
     // all of them at "the game's own" the report goes out as the
     // game sent it (upstream #228's fix).
     state_stamp_config(outputData + 3, true);
-    bt_write(outputData, sizeof(outputData));
-    return true;
+    // error: LOGGED-OK — counter bt_send_drops (0xFD, OLED Diagnostics); false when the output queue is full, so g_host_out02_to_bt counts only reports that went out
+    return bt_write(outputData, sizeof(outputData));
 }
 
 // A host output report 0x02 (buffer[0] = 0x02, bufsize >= 2): counted for
 // the diagnostics and forwarded to the controller as a 0x31.
 static void host_out02(const uint8_t *buffer, uint16_t bufsize) {
-    g_host_out02_total++;
+    g_host_out02_total = g_host_out02_total + 1;
     // valid_flag0 lives at buffer[1] (right after the 0x02 report id).
     // Bits 2 & 3 are AllowRight/LeftTriggerFFB.
     if (bufsize > 1 && (buffer[1] & 0x0C)) {
-        g_host_out02_trig_allow++;
+        g_host_out02_trig_allow = g_host_out02_trig_allow + 1;
     }
     if ((size_t) bufsize - 1 >= sizeof(g_last_out02)) {
         memcpy(g_last_out02, buffer + 1, sizeof(g_last_out02));
         if (buffer[1] & 0x0C) memcpy(g_last_out02_trig, buffer + 1, sizeof(g_last_out02_trig));
     }
     // error: NOT-WORTH — nothing; a malformed/short host report isn't forwarded (counted only when forwarded, g_host_out02_to_bt); games send well-formed ones every frame
-    if (host_out02_forward(buffer, bufsize)) g_host_out02_to_bt++;
+    if (host_out02_forward(buffer, bufsize)) g_host_out02_to_bt = g_host_out02_to_bt + 1;
 }
 
 void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t report_type, uint8_t const *buffer,
@@ -505,13 +537,13 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
     if (usb_wake_keyboard()) return;  // the wake keyboard's LED report: nothing to do
 
     if (report_id != 0) {
-        g_setfeat_count++;
+        g_setfeat_count = g_setfeat_count + 1;
         g_setfeat_last = report_id | (bufsize ? buffer[0] : 0) << 8 | (uint32_t) bufsize << 16;
     }
 
     if (is_pico_cmd(report_id)) {
         printf("[HID] Receive 0xf6 setting config, funcid:0x%02X\n", buffer[0]);
-        pico_cmd_set(report_id, buffer, bufsize);
+        pico_cmd_set_hid(report_id, buffer, bufsize);
         return;
     }
 
@@ -545,10 +577,18 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
         report_id == 0x62 ||
         report_id == 0x61) {
         set_feature_data(report_id, const_cast<uint8_t *>(buffer), bufsize);
+        dse_on_host_set(report_id);       // older replies no longer answer the PC's reads
         dse_on_profile_write(report_id);  // 0x60-0x62: re-read the profiles
         return;
     }
 }
+
+// What this image is, in the UF2's binary info (fw_identity.h), for the
+// release gate that checks an image against its feed entry (step 7, G2). The
+// SDK already records PICO_BOARD; these are the feed's own names.
+bi_decl(bi_string(BINARY_INFO_MAKE_TAG(DS5_BI_TAG_C1, DS5_BI_TAG_C2), fwid::kBiBoard, DS5_BOARD_KEY));
+bi_decl(bi_string(BINARY_INFO_MAKE_TAG(DS5_BI_TAG_C1, DS5_BI_TAG_C2), fwid::kBiPersonas, "ds5"));
+bi_decl(bi_string(BINARY_INFO_MAKE_TAG(DS5_BI_TAG_C1, DS5_BI_TAG_C2), fwid::kBiDisplays, DS5_DISPLAYS_BI));
 
 #if PICO_RP2350 && SYS_CLOCK_KHZ == 150000 && SYS_CLK_KHZ != 150000
 #error "the Pico 2 W build assumes the SDK boots clk_sys at 150 MHz"
@@ -570,6 +610,10 @@ int main() {
     sleep_ms(1000);
     set_sys_clock_khz(SYS_CLOCK_KHZ, true);
 #endif
+
+    // Flash size and chip package (0xEA), first: the saved-state lock must be
+    // known before anything writes flash (config migration, BTstack's bank).
+    board_facts_probe();
 
     board_init();
     tusb_rhport_init_t dev_init = {
@@ -599,15 +643,28 @@ int main() {
 
     // A failed radio start is retried by a reboot, not left hanging: main()
     // returning (as before) stopped the board for good, before the watchdog
-    // was armed, until it was unplugged.
-    // error: LOGGED-OK — printf, then a reboot to retry: nothing can run without the radio; a fault that persists shows as a board that never comes up
+    // was armed, until it was unplugged. The third failed start in a row
+    // (radio_boot.h; a power cycle starts the count again) stops instead and
+    // says why on the OLED: a board without the wireless chip (a Pico 2 given
+    // the Pico 2 W image) used to reboot for ever and show nothing.
+    // error: SHOWN — the OLED's "No wireless chip found" screen after the third failed start; until then a reboot retries (printf)
     if (cyw43_arch_init()) {
+        const uint32_t count = radio_boot::after_failure(watchdog_hw->scratch[radio_boot::kScratch]);
+        watchdog_hw->scratch[radio_boot::kScratch] = count;
+        if (radio_boot::should_stop(count)) {
+            printf("No wireless chip found, stopped\n");
+            config_load();  // the saved display choice; reads only, unless an old config needs moving
+            oled_fault("No wireless chip", "found: this firmware", "is for the " DS5_BOARD_NAME);
+            // loop: NOT-WORTH — stopped on purpose (no radio); the watchdog isn't armed, unplugging starts over
+            for (;;) tight_loop_contents();
+        }
         printf("Failed to initialize CYW43, rebooting\n");
         sleep_ms(500);
         watchdog_reboot(0, 0, 0);
         // loop: NOT-WORTH — boot failure: waits the few µs for the watchdog reset
         for (;;) tight_loop_contents();
     }
+    watchdog_hw->scratch[radio_boot::kScratch] = 0;  // the radio started: the count starts over
 #ifdef CYW43_WL_GPIO_SMPS_PIN
     // The Pico W's SMPS in PWM mode: no coil whine under light load (upstream 23a55da, #207).
     cyw43_arch_gpio_put(CYW43_WL_GPIO_SMPS_PIN, true);
@@ -636,9 +693,6 @@ int main() {
     }
 #endif
 
-    // Initialize the critical section for the report buffer
-    critical_section_init(&report_cs);
-
     config_load();
     remap_load();
     calib_load();
@@ -649,6 +703,8 @@ int main() {
     audio_init();
     state_init();
     oled_init();
+    // error: SHOWN — the OLED notice here and 0xEA [10] bit1 for the app; settings work until the board restarts
+    if (board_saved_state_off()) oled_notice(oled_toast::kFlashSmall);
 
 #if !ENABLE_SERIAL
     watchdog_enable(1000, true);

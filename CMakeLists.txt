@@ -15,18 +15,30 @@ if (WIN32)
 else ()
     set(USERHOME $ENV{HOME})
 endif ()
-set(sdkVersion 2.3.0)
+set(sdkVersion 2.3.1)
 set(toolchainVersion 15_2_Rel1)
-set(picotoolVersion 2.3.0)
+set(picotoolVersion 2.3.1)
 set(picoVscode ${USERHOME}/.pico-sdk/cmake/pico-vscode.cmake)
 if (EXISTS ${picoVscode})
     include(${picoVscode})
 endif ()
 # ====================================================================================
 
+option(PICO_W_BUILD "Build for Raspberry Pi Pico W, audio is missing" OFF)
+option(WAVESHARE_RP2350B_PLUS_W_BUILD "Build for Waveshare RP2350B-Plus-W (RP2350B, RM2, 16 MiB flash)" OFF)
+if (PICO_W_BUILD AND WAVESHARE_RP2350B_PLUS_W_BUILD)
+        message(FATAL_ERROR "PICO_W_BUILD and WAVESHARE_RP2350B_PLUS_W_BUILD are mutually exclusive")
+endif ()
+
 if (PICO_W_BUILD)
         set(PICO_BOARD pico_w CACHE STRING "Board type")
         set(PICO_RP2350 OFF CACHE BOOL "Not using RP2350")
+elseif (WAVESHARE_RP2350B_PLUS_W_BUILD)
+        set(PICO_BOARD waveshare_rp2350b_plus_w CACHE STRING "Board type")
+        list(APPEND PICO_BOARD_HEADER_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/boards/headers")
+        if (NOT PICO_BOARD STREQUAL "waveshare_rp2350b_plus_w")
+                message(FATAL_ERROR "Waveshare build has cached PICO_BOARD=${PICO_BOARD}; use a fresh build directory")
+        endif ()
 else ()
         set(PICO_BOARD pico2_w CACHE STRING "Board type")
 endif ()
@@ -57,7 +69,6 @@ if (DISABLE_SPEAKER_PROC)
 else ()
         set(DISABLE_SPEAKER_PROC_VALUE 0)
 endif ()
-option(PICO_W_BUILD "Build for Rasberry Pi Pico W, audio is missing" OFF)
 # Pico 2 W clock. The default is upstream awalol v0.7.0's (a023371): the
 # RP2350's rated 150 MHz at the boot-default core voltage, CYW43 PIO clock
 # divider 2; main() leaves clock and voltage as the bootrom/SDK set them.
@@ -88,8 +99,8 @@ project(ds5-bridge C CXX ASM)
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
-# The pins are in tools/toolchain.env (Pico SDK 2.3.0, TinyUSB 0.21 at upstream's
-# commit). The relocate_to_ram() section names below are TinyUSB 0.21's, and a
+# The pins are in tools/toolchain.env (Pico SDK 2.3.1, TinyUSB 0.21 at upstream's
+# commit 98741b5, which still reports 0.21). The relocate_to_ram() section names below are TinyUSB 0.21's, and a
 # name that matches nothing silently leaves that code in flash, so refuse any
 # other TinyUSB minor version rather than build a slower firmware.
 # (The SDK resolves PICO_TINYUSB_PATH in its own directory scope, the same way.)
@@ -105,7 +116,7 @@ file(STRINGS "${_tusb_dir}/src/tusb_option.h" _tusb_ver
 string(REGEX REPLACE ".*MAJOR +([0-9]+).*MINOR +([0-9]+).*" "\\1.\\2" _tusb_ver "${_tusb_ver}")
 if (NOT _tusb_ver STREQUAL "0.21")
     message(FATAL_ERROR "TinyUSB at ${_tusb_dir} is ${_tusb_ver}; this firmware needs 0.21 "
-        "(tools/toolchain.env: Pico SDK 2.3.0 with lib/tinyusb at TINYUSB_REF; see CLAUDE.md, Build)")
+        "(tools/toolchain.env: Pico SDK 2.3.1 with lib/tinyusb at TINYUSB_REF; see CLAUDE.md, Build)")
 endif ()
 
 # Add executable. Default name is the project name, version 0.1
@@ -129,6 +140,7 @@ add_executable(ds5-bridge
         src/perf.cpp
         src/ctrl_info.cpp
         src/dse.cpp
+        src/board_facts.cpp
         src/ram_mem.c
 )
 # The narrator's lines (tools/build_voice_bank.py), .incbin'd by voice.cpp.
@@ -229,7 +241,7 @@ relocate_to_ram(src/common/pico_util/queue.c.o
 
 # --- Core0's Bluetooth/USB hot path in RAM (upstream awalol Phases B.2-B.4),
 # RP2350 only (see src/core0_ram.h: the Pico W's RP2040 can't spare the RAM).
-# Section names are TinyUSB 0.21's (pico-sdk 2.3.0; the configure check above
+# Section names are TinyUSB 0.21's at 98741b5 (pico-sdk 2.3.1; the configure check above
 # refuses another TinyUSB). A rename that matches nothing does nothing: 0.21's
 # FIFO bulk movers are tu_fifo_{read,write}_n_access_mode, and tu_fifo_read_n /
 # write_n / count became always-inline wrappers with no section of their own
@@ -238,7 +250,7 @@ relocate_to_ram(src/common/pico_util/queue.c.o
 if (PICO_RP2350)
 # B.2: per-packet BT/USB transport.
 relocate_to_ram(lib/btstack/src/hci.c.o
-    ".text.packet_handler=.time_critical.bt_packet_handler"
+    ".text.packet_handler=.time_critical.bt_packet_handler|.text.hci_transport_packet_handler=.time_critical.hci_transport_packet_handler"
     "B.2: btstack hci.c packet_handler (HCI event/ACL dispatch) -> RAM")
 relocate_to_ram(lib/btstack/src/l2cap.c.o
     ".text.l2cap_acl_handler=.time_critical.l2cap_acl_handler"
@@ -304,17 +316,15 @@ target_compile_options(ds5-bridge PRIVATE -fsigned-char)
 target_compile_definitions(wdl_resampler PRIVATE
         WDL_RESAMPLE_TYPE=float
 )
-# The board's name as hosts show it (identity [30..45], protocol 1.7).
-if (PICO_BOARD STREQUAL "pico_w")
-        set(DS5_BOARD_NAME "Pico W")
-elseif (PICO_BOARD STREQUAL "pico2_w")
-        set(DS5_BOARD_NAME "Pico 2 W")
-else ()
-        set(DS5_BOARD_NAME "${PICO_BOARD}")
-endif ()
+# The board's name as hosts show it (identity [30..45], protocol 1.7), and
+# its board type id for 0xEA [3..4] (protocol 1.21, src/fw_identity.h) and the
+# UF2's binary info: from boards.json (cmake/ds5_board.cmake).
+include(cmake/ds5_board.cmake)
 
 target_compile_definitions(ds5-bridge PRIVATE
         DS5_BOARD_NAME="${DS5_BOARD_NAME}"
+        DS5_BOARD_TYPE_ID=${DS5_BOARD_TYPE_ID}
+        DS5_BOARD_KEY="${PICO_BOARD}"
         CYW43_LWIP=0
         ENABLE_SERIAL=${ENABLE_SERIAL_VALUE}
         PICO_FLASH_ASSUME_CORE1_SAFE=0 # core1 registers for flash lockout (flash_safe.h)
@@ -350,6 +360,18 @@ if (ENABLE_STACK_USAGE)
         target_compile_options(ds5-bridge PRIVATE -fstack-usage)
         target_compile_options(opus PRIVATE -fstack-usage)
         target_compile_options(wdl_resampler PRIVATE -fstack-usage)
+endif ()
+# Serial (debug) builds guard the bottom of both cores' stacks, so an overflow
+# faults where it happens instead of corrupting the memory below it (core0
+# runs on the SDK's default stack with deep BTstack -> callback chains).
+# Core0's guard sits at __StackTop - PICO_STACK_SIZE (the SDK's default
+# 0x800, 2 KB), stricter than a release build, where nothing stops core0's
+# stack at 2 KB (it can run on through SCRATCH_Y into SCRATCH_X). So a clean
+# serial run proves release safe; a guard fault in a serial build may be a
+# 2 KB false alarm: read the faulting address against __StackBottom before
+# calling it a release bug.
+if (ENABLE_SERIAL)
+        target_compile_definitions(ds5-bridge PRIVATE PICO_USE_STACK_GUARDS=1)
 endif ()
 
 # Control-only vendor-class USB interface for the desktop configurator
@@ -455,6 +477,15 @@ target_link_options(ds5-bridge PRIVATE -Wl,--wrap=flash_safe_execute)
 # Keep the start of saved state in the image (src/config.cpp; nothing reads it)
 # for tools/check_flash_reserved.py: a required symbol is a --gc-sections root.
 target_link_options(ds5-bridge PRIVATE -Wl,--require-defined=ds5_reserved_flash_start)
+
+# RP2350: picotool seals a SHA-256 hash of the image into its block loop, and
+# the boot ROM checks it before running the image, so a firmware write cut
+# short (USB pulled mid-update) is not started as a half-written image; the
+# board stays in BOOTSEL instead (review update-flash M3). The RP2040's boot
+# ROM has no such check.
+if (PICO_PLATFORM MATCHES "^rp2350")
+        pico_hash_binary(ds5-bridge)
+endif ()
 
 pico_add_extra_outputs(ds5-bridge)
 

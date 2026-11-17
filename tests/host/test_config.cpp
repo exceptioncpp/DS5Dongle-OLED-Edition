@@ -45,6 +45,8 @@ TEST(config_erased_flash_gives_documented_defaults) {
     CHECK_EQ(c.status_gpio_mode, 0);
     CHECK_EQ(c.mic_level, 0);  // follow the PC (1.16)
     CHECK_EQ(c.mic_echo_cancel, 1);  // on (1.17)
+    CHECK_EQ(c.packet_mode, 0);         // the packed 0x39 (1.22)
+    CHECK_EQ(c.disconnect_on_dock, 0);  // off (1.22)
     CHECK(config_unsaved());  // nothing valid saved yet
 }
 
@@ -472,4 +474,23 @@ TEST(config_audio_buffer_floor) {
     config_default();
     config_load();
     CHECK_EQ(get_config().audio_buffer_length, 32);
+}
+
+// Review fw-usb-bt N5: a slot switch (bt.cpp make_slot_current) saves the
+// current slot on its own; a settings edit the app hasn't saved stays unsaved.
+TEST(config_slot_save_keeps_unsaved_edits_unsaved) {
+    fake_flash_erase_all();
+    g_fake_flash_fail = false;
+    config_default();
+    CHECK(config_save());
+    Config_body b = get_config();
+    b.inactive_time = 42;  // an unsaved edit
+    set_config(b);
+    CHECK(config_save_current_slot(2));
+    CHECK_EQ(get_config().current_slot, 2);
+    CHECK_EQ(get_config().inactive_time, 42);  // RAM keeps the edit
+    CHECK(config_unsaved());                   // and it is still unsaved
+    config_load();
+    CHECK_EQ(get_config().current_slot, 2);    // the slot was saved
+    CHECK_EQ(get_config().inactive_time, 30);  // the edit was not
 }

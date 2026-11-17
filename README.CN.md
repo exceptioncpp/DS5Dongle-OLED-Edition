@@ -191,7 +191,7 @@
 
 | 物品 | 说明 | 大致价格 |
 |---|---|---|
-| **Raspberry Pi Pico 2 W** | 搭载 RP2350 MCU，板载 CYW43 蓝牙/WiFi。[官方产品页](https://www.raspberrypi.com/products/raspberry-pi-pico-2/) | 约 $7 USD |
+| **Raspberry Pi Pico 2 WH**（推荐）或 **Pico 2 W** | 搭载 RP2350 MCU，板载 CYW43 蓝牙/WiFi。**WH** 已焊好排针，下面的 OLED 可以直接插上；普通的 **W** 需要先自行焊接排针。[官方产品页](https://www.raspberrypi.com/products/raspberry-pi-pico-2/) | 约 $8 USD（WH），约 $7 USD（W） |
 | **索尼 DualSense 控制器** | 任何 PS5 DualSense（VID `054C:0CE6`）或 DualSense Edge（`054C:0DF2`）。 | — |
 | **USB-C 线缆** | 把 Pico 2 W 连接到主机电脑。 | — |
 
@@ -208,7 +208,7 @@ Pico 2 W 和 Waveshare Pico-OLED-1.3 在全球都很容易买到：
 
 - **Adafruit**、**Pimoroni**、**The Pi Hut**、**DigiKey**、**Mouser** —— 主要电子元件分销商（美 / 欧）
 - **Waveshare 自营商店** 购买 OLED 插件
-- 各地区 **Amazon** 店面 —— 搜索 `Raspberry Pi Pico 2 W` 和 `Waveshare Pico-OLED-1.3`（或 SKU `HIPI1798`）
+- 各地区 **Amazon** 店面 —— 搜索 `Raspberry Pi Pico 2 WH` 和 `Waveshare Pico-OLED-1.3`（或 SKU `HIPI1798`）
 - **AliExpress（速卖通）** —— 原装 Waveshare 与 Pico 货源以及仿品；注意查看卖家评分
 
 ## 快速开始
@@ -333,17 +333,17 @@ scripts/set_ds5.py --help                     # 完整参数列表
 
 从源码编译本项目：
 
-1. 安装 Pico SDK **2.3.0**。编译使用 `pico_sdk_import.cmake`。CI 和正式版本使用 ARM 官方 GNU 工具链 **15.2.Rel1**（`arm-none-eabi`）构建；发行版自带的 `gcc-arm-none-eabi` 通常也能用，但 15.2.Rel1 能得到与正式版本相同的二进制。确切的版本（SDK、TinyUSB 提交、工具链下载地址）见 `tools/toolchain.env`。如果工具链不在 `PATH` 中，请把 `PICO_TOOLCHAIN_PATH` 设为解压后的工具链目录。
-2. **在 Pico SDK 内把 TinyUSB 固定到 `tools/toolchain.env` 中的提交**（`$PICO_SDK_PATH/lib/tinyusb`）：即 TinyUSB 0.21 加上之后的修复，与上游一致。Pico SDK 2.3.0 捆绑的仍是 0.18.0，它没有本项目 `tusb_config.h` 使用的 `TUD_AUDIO_EP_SIZE` 四参数形式；而且除 0.21 以外的 TinyUSB 都会被构建拒绝：
+1. 安装 Pico SDK **2.3.1**。编译使用 `pico_sdk_import.cmake`。CI 和正式版本使用 ARM 官方 GNU 工具链 **15.2.Rel1**（`arm-none-eabi`）构建；发行版自带的 `gcc-arm-none-eabi` 通常也能用，但 15.2.Rel1 能得到与正式版本相同的二进制。确切的版本（SDK、TinyUSB 提交、工具链下载地址）见 `tools/toolchain.env`。如果工具链不在 `PATH` 中，请把 `PICO_TOOLCHAIN_PATH` 设为解压后的工具链目录。
+2. **在 Pico SDK 内把 TinyUSB 固定到 `tools/toolchain.env` 中的提交**（`$PICO_SDK_PATH/lib/tinyusb`）：即 TinyUSB 0.21 加上之后的修复，与上游一致。Pico SDK 2.3.1 捆绑的仍是 0.18.0，它没有本项目 `tusb_config.h` 使用的 `TUD_AUDIO_EP_SIZE` 四参数形式；而且除 0.21 以外的 TinyUSB 都会被构建拒绝：
    ```bash
    cd "$PICO_SDK_PATH/lib/tinyusb"
-   git fetch --depth 1 origin 2d56dc533e45e4e91b15e93fdab5e22e964f328d
+   git fetch --depth 1 origin 98741b55959564746998d0453c32d87064629d7c
    git checkout --detach FETCH_HEAD
    ```
 3. 用 CMake + Ninja（或 Make）配置并编译：
    ```bash
    cd /path/to/DS5Dongle
-   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_PATH="$PICO_SDK_PATH"
+   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_PATH="$PICO_SDK_PATH" -DENABLE_COMPANION_VENDOR=ON
    cmake --build build --target ds5-bridge
    ```
 4. UF2 会生成在 `build/ds5-bridge-oled.uf2`。照常用 BOOTSEL 刷写。
@@ -353,6 +353,19 @@ scripts/set_ds5.py --help                     # 完整参数列表
 - `-DENABLE_BATT_LED=ON`（默认）—— DS5 电量低时闪烁 Pico LED。
 - `-DENABLE_SERIAL=ON` —— 把 printf 输出到 USB CDC 用于调试（默认 OFF；正式构建不占用 UART）。
 - `-DPICO_W_BUILD=ON` —— 为初代 Pico W 编译（去掉音频、降低时钟）。默认目标是 Pico 2 W。
+
+### Waveshare RP2350B-Plus-W
+
+[Waveshare RP2350B-Plus-W](https://www.waveshare.com/wiki/RP2350B-Plus-W) 配备 RP2350B、RM2 无线模块（与 Pico 2 W 相同的 CYW43 芯片）、16 MiB QSPI 闪存和 USB-C。使用 `-DWAVESHARE_RP2350B_PLUS_W_BUILD=ON` 启用此开发板配置；该选项默认关闭，默认目标仍为 Pico 2 W。请使用新的构建目录和上文固定版本的工具链：
+
+```bash
+cmake -S . -B build/waveshare -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DPICO_SDK_PATH="$PICO_SDK_PATH" -DWAVESHARE_RP2350B_PLUS_W_BUILD=ON \
+      -DENABLE_COMPANION_VENDOR=ON
+cmake --build build/waveshare --target ds5-bridge
+```
+
+输出文件为 `build/waveshare/ds5-bridge-oled.uf2`。`ENABLE_COMPANION_VENDOR=ON` 启用桌面配置器接口。Waveshare 选项不能与 `PICO_W_BUILD=ON` 同时启用。OLED 接线和 Waveshare 固件手动更新说明见[开发板指南](boards/README.md)。
 
 ## 诊断与调试工具
 

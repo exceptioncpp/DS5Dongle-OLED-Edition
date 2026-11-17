@@ -6,17 +6,19 @@
 #include <unistd.h>
 #include "audio.h"
 #include "audio_levels.h"
+#include "auto_haptics.h"
 #include "bt.h"
 #include "core0_ram.h"
 #include "grip_wave.h"
 #include "haptics_decimate.h"
 #include "mic_level.h"
 #include "mic_session.h"
-#include "resample.h"
 #include "speaker_mono.h"
+#include "speaker_resample.h"
 #include "tusb.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include "opus.h"
 #include "utils.h"
@@ -38,8 +40,12 @@
 // re-broadcast at the audio rate any more.
 #define REPORT_SIZE       547
 #define REPORT_ID         0x39
-// #define VOLUME_GAIN       2
-// #define BUFFER_LENGTH     48
+// 0.7.2's one-frame report (upstream 95dcdbb, packet_mode 1, protocol 1.22):
+// one haptic + one speaker frame, twice the report rate, the same 0x39 header
+// but one more buffer-length byte ([3] = 7, [4] bit 7 set). For A/B against
+// the packed 0x39 (upstream #185: haptics less detailed since 0.7.x).
+#define REPORT_SIZE_SINGLE 398
+#define REPORT_ID_SINGLE   0x36
 
 // DualSense microphone, ported from awalol/DS5Dongle's `mic` branch.
 // The DS5 sends mic audio as Opus packets embedded in BT input report
@@ -62,7 +68,7 @@ queue_t audio_fifo;
 // haptic frames. Ported from upstream (awalol 8eb8612): a queue per stream
 // instead of one shared opus_buf that core1 overwrote and core0 re-read —
 // which could send the same speaker frame twice or skip one (crackle).
-// audio_bt_task() pairs one haptic frame with one speaker frame per 0x36.
+// audio_bt_task() sends two haptic and two speaker frames per 0x39.
 #define SPEAKER_OPUS_SIZE 200
 struct audio_spk_element { uint8_t data[SPEAKER_OPUS_SIZE]; };
 struct haptics_element { int8_t data[SAMPLE_SIZE]; };
@@ -109,6 +115,16 @@ uint32_t audio_mic_plc_frames() { return g_mic_plc_frames; }
 // The jitter buffer's level control (src/mic_level.h); core0 only (mic_drain).
 static MicLevel g_mic_level;
 uint32_t audio_mic_level_drops() { return g_mic_level.drops; }
+// Mic audio lost elsewhere (0xFD [54..59], OLED Diagnostics "Mic i b u"):
+// Opus packets dropped because mic_fifo was full (core1 behind), decoded
+// frames dropped because the jitter buffer was full, and 1 ms silent slices
+// written while playing because the jitter buffer ran dry (a hole in the audio).
+static volatile uint32_t g_mic_in_drops = 0;      // core0 writes
+static volatile uint32_t g_mic_buf_drops = 0;     // core1 writes
+static volatile uint32_t g_mic_underruns = 0;     // core0 writes
+uint32_t audio_mic_in_drops() { return g_mic_in_drops; }
+uint32_t audio_mic_buf_drops() { return g_mic_buf_drops; }
+uint32_t audio_mic_underruns() { return g_mic_underruns; }
 uint8_t audio_mic_level() { return g_mic_level.level; }
 uint8_t audio_mic_level_max() { return g_mic_level.max_level; }
 
@@ -122,6 +138,7 @@ bool audio_mic_wanted() { return mic_active && get_config().bt_mic_enable; }
 
 struct audio_raw_element {
     float data[512 * 2];
+    uint32_t gen;  // the speaker stream it came from (s_spk_gen)
 };
 
 void set_headset(bool state) {
@@ -188,6 +205,8 @@ uint32_t audio_hap_push() { return g_hap_push; }
 // emulator's USB / BT rate display. Updated below.
 static volatile uint32_t g_usb_frames = 0;
 static volatile uint32_t g_bt_packets = 0;
+static volatile uint32_t g_usb_out_overruns = 0;  // audio_loop found the PC's speaker FIFO full
+uint32_t audio_usb_out_overruns() { return g_usb_out_overruns; }
 uint32_t audio_usb_frames() { return g_usb_frames; }
 uint32_t audio_bt_packets() { return g_bt_packets; }
 
@@ -213,16 +232,23 @@ void CORE0_RAM_FUNC(mic_add_queue)(const uint8_t *data) {
     static mic_element packet{};
     memcpy(packet.data, data, MIC_OPUS_SIZE);
     g_mic_toc = data[0]; // first byte of the Opus packet
-    if (queue_is_full(&mic_fifo)) queue_try_remove(&mic_fifo, NULL);
-    // error: LOGGED-OK — counter (mic FIFO level in 0xF5); oldest mic packet is dropped first, so the add cannot fail; a drop is a glitch, not a user action
-    queue_try_add(&mic_fifo, &packet);
+    // Full: drop the oldest and add again (testing queue_is_full first raced
+    // core1, which could take one in between).
+    // error: LOGGED-OK — counter g_mic_in_drops below; a full queue drops the oldest packet
+    if (!queue_try_add(&mic_fifo, &packet)) {
+        queue_try_remove(&mic_fifo, NULL);
+        // error: LOGGED-OK — counter g_mic_in_drops (0xFD, OLED Diagnostics "Mic i"); a drop is a glitch, not a user action
+        g_mic_in_drops = g_mic_in_drops + 1;
+        // error: NOT-WORTH — only this core adds, so the slot just freed is still free
+        queue_try_add(&mic_fifo, &packet);
+    }
 }
 
 // Tell the DS5 whether to stream its mic (0x32 audio-control report, as
 // upstream's update_mic_status). Sent on every change of audio_mic_wanted()
 // and on each new BT link; the setting is sticky on the controller, so the
 // old ~4 Hz keepalive isn't needed.
-static void update_mic_status(bool enable) {
+static bool update_mic_status(bool enable) {
     uint8_t pkt[142]{};
     pkt[0] = 0x32;
     pkt[1] = reportSeqCounter << 4;
@@ -230,7 +256,8 @@ static void update_mic_status(bool enable) {
     pkt[2] = 0x11 | 0 << 6 | 1 << 7;
     pkt[3] = 1;
     pkt[4] = enable ? 0b00000011 : 0b00000010;
-    bt_write(pkt, sizeof(pkt));
+    // error: LOGGED-OK — counter bt_send_drops (0xFD, OLED Diagnostics); false = not sent, mic_status_task sends it again
+    return bt_write(pkt, sizeof(pkt));
 }
 
 static volatile bool mic_status_dirty = true;
@@ -241,12 +268,17 @@ static void mic_status_task() {
     static bool sent = false;
     const bool want = audio_mic_wanted();
     if (!bt_is_connected()) return;
+    if (!mic_status_dirty && want == sent) return;
+    // Sent once per change, so it must not be lost: with the output queue
+    // full it waits for room, and a report that still didn't go out is sent
+    // again on the next pass.
+    // error: NOT-WORTH — not a failure: the output queue is full, the 0x32 waits for the next pass
+    if (bt_send_full()) return;
     if (mic_status_dirty) bt_send_state(); // new link: re-apply state now the DS5 is ready
-    if (mic_status_dirty || want != sent) {
-        update_mic_status(want);
-        sent = want;
-        mic_status_dirty = false;
-    }
+    // error: LOGGED-OK — counter bt_send_drops (0xFD, OLED Diagnostics); not sent: mic_status_dirty / sent stay as they were, so the next pass sends it again
+    if (!update_mic_status(want)) return;
+    sent = want;
+    mic_status_dirty = false;
 }
 
 // Mic out: feed decoded PCM to the USB IN FIFO in 1 ms slices whenever it has
@@ -295,13 +327,21 @@ static void mic_drain() {
                 // too; armed means more than 3, so a next frame is there.
                 if (g_mic_level.sample(now, queued) && queued > 1
                     && g_mic_level.drop(now, mic_frame_peak(frame.mono, MIC_FRAMES))) {
+                    // The dropped frame's start, to crossfade the next one from.
+                    static int16_t head[kMicSpliceSamples];
+                    memcpy(head, frame.mono, sizeof(head));
                     // error: NOT-WORTH — nothing; queued > 1 means a frame is waiting, and only this core removes from mic_decode_fifo
                     queue_try_remove(&mic_decode_fifo, &frame);
+                    mic_splice(head, frame.mono, kMicSpliceSamples);
                 }
             } else {
+                // Playing and the jitter buffer is empty: a 1 ms hole.
+                // error: LOGGED-OK — counter g_mic_underruns (0xFD, OLED Diagnostics "Mic u"); BT jitter or a slow controller clock, nothing for the user to do
+                if (started) g_mic_underruns = g_mic_underruns + 1;
                 memset(slice, 0, sizeof(slice));
                 // error: LOGGED-OK — g_mic_last_wrote / last_want in OLED Diag + 0xF5; a short USB write is an underrun the PC's audio stack conceals
-                tud_audio_write(slice, MIC_SLICE_BYTES);
+                g_mic_last_wrote = tud_audio_write(slice, MIC_SLICE_BYTES);
+                g_mic_last_want  = MIC_SLICE_BYTES;
                 break;
             }
         }
@@ -319,10 +359,15 @@ static void mic_drain() {
     }
 }
 
-// Send one 0x39 once two haptic frames and two speaker frames are queued
-// (upstream audio_bt_task). Both streams come from the same USB audio at the
-// same rate, so they stay paired; this halves the BT packet rate vs one 0x36
-// per frame.
+// The PC opened the speaker stream (USB alt setting != 0): audio_loop drops
+// the previous stream's leftovers. Set and read on core0 (tud_task, audio_loop).
+static bool s_spk_stream_opened = false;
+void audio_speaker_stream_opened() { s_spk_stream_opened = true; }
+// Counts speaker streams (core0 writes, core1 reads): core1 drops a block it
+// encoded for an older stream instead of queueing it after the flush, and
+// clears the resampler's history when a new stream's first block arrives.
+static volatile uint32_t s_spk_gen = 0;
+
 // When the host last sent audio through us: while it streams, the narrator's
 // frames ride in its reports; otherwise voice_task() sends them on its own.
 static uint64_t s_host_audio_us = 0;
@@ -349,12 +394,72 @@ static inline __attribute__((always_inline)) void report_header(uint8_t *pkt) {
     pkt[11] = SAMPLE_SIZE;
 }
 
+// One 0x36 (packet_mode 1): one haptic frame and, unless the speaker is
+// off / not ready, one speaker frame (or the narrator's). From RAM like
+// audio_bt_task (tools/check_ram_residency.sh), and out of line so its
+// 398-byte report and the 0x39's 547 bytes are never on core0's 2 KB stack
+// together.
+static void __attribute__((noinline)) CORE0_RAM_FUNC(send_single_report)(bool spk_ready) {
+    uint8_t pkt[REPORT_SIZE_SINGLE]{};
+    pkt[0] = REPORT_ID_SINGLE;
+    pkt[1] = reportSeqCounter << 4;
+    reportSeqCounter = (reportSeqCounter + 1) & 0x0F;
+    pkt[2] = 0x11 | 0 << 6 | 1 << 7;
+    pkt[3] = 7;  // one more set bit in [4], one more byte below (0.7.2's layout)
+    pkt[4] = audio_mic_wanted() ? 0b11111111 : 0b11111110;
+    const auto buf_len = get_config().audio_buffer_length;
+    pkt[5] = buf_len;
+    pkt[6] = buf_len;
+    pkt[7] = buf_len;
+    pkt[8] = buf_len; // AudioBufferLength
+    pkt[9] = buf_len; // AudioBufferLength
+    pkt[10] = packetCounter++;
+    // Haptics Audio Data (1 frame)
+    pkt[11] = 0x12 | 0 << 6 | 1 << 7;
+    pkt[12] = SAMPLE_SIZE;
+    static haptics_element hap{};
+    queue_try_remove(&haptics_fifo, &hap);
+    memcpy(pkt + 13, hap.data, SAMPLE_SIZE);
+#if !DISABLE_SPEAKER_PROC
+    // Speaker Audio Data (1 frame): the block tag without bit 6 (one frame).
+    const uint8_t tag = (uint8_t) (speaker_block_tag() & ~(1 << 6));
+    if (spk_ready) {
+        static audio_spk_element spk{};
+        queue_try_remove(&audio_spk_fifo, &spk);
+        memcpy(pkt + 79, spk.data, SPEAKER_OPUS_SIZE);
+        pkt[77] = tag;
+        pkt[78] = SPEAKER_OPUS_SIZE;
+    }
+    // A narrator line takes the speaker's place while it plays.
+    if (voice_take_frame(pkt + 79, SPEAKER_OPUS_SIZE)) {
+        pkt[77] = tag;
+        pkt[78] = SPEAKER_OPUS_SIZE;
+    }
+#else
+    (void) spk_ready;
+#endif
+    // error: LOGGED-OK — counter bt_send_drops (0xFD, OLED Diagnostics); a full output queue loses this report's audio, and it isn't counted as sent
+    if (bt_write(pkt, sizeof(pkt))) g_bt_packets = g_bt_packets + 1;
+}
+
+// Send one 0x39 once two haptic frames and two speaker frames are queued
+// (upstream audio_bt_task). Both streams come from the same USB audio at the
+// same rate, so they stay paired; this halves the BT packet rate vs one
+// report per frame.
 static void CORE0_RAM_FUNC(audio_bt_task)() {
-    if (queue_get_level(&haptics_fifo) < 2) return;
+    // packet_mode (protocol 1.22): 0 = the packed 0x39 (two frames each), 1 = one 0x36 per frame.
+    const unsigned frames = get_config().packet_mode == 1 ? 1 : 2;
+    if (queue_get_level(&haptics_fifo) < frames) return;
 #if !DISABLE_SPEAKER_PROC
     const bool spk_ready = g_spk_ready && speaker_output_on();
-    if (spk_ready && queue_get_level(&audio_spk_fifo) < 2) return;
+    if (spk_ready && queue_get_level(&audio_spk_fifo) < frames) return;
+#else
+    const bool spk_ready = false;
 #endif
+    if (frames == 1) {
+        send_single_report(spk_ready);
+        return;
+    }
 
     uint8_t pkt[REPORT_SIZE]{};
     report_header(pkt);
@@ -373,8 +478,8 @@ static void CORE0_RAM_FUNC(audio_bt_task)() {
             pkt[140] = speaker_block_tag();
             pkt[141] = SPEAKER_OPUS_SIZE;
         }
-        bt_write(pkt, sizeof(pkt));
-        g_bt_packets++;
+        // error: LOGGED-OK — counter bt_send_drops (0xFD, OLED Diagnostics); a full output queue loses this report's audio, and it isn't counted as sent
+        if (bt_write(pkt, sizeof(pkt))) g_bt_packets = g_bt_packets + 1;
         return;
     }
     // Speaker Audio Data (2 frames)
@@ -392,12 +497,13 @@ static void CORE0_RAM_FUNC(audio_bt_task)() {
     voice_take_frames(pkt + 142, pkt + 142 + SPEAKER_OPUS_SIZE, SPEAKER_OPUS_SIZE);
 #endif
 
-    bt_write(pkt, sizeof(pkt));
-    g_bt_packets++;
+    // error: LOGGED-OK — counter bt_send_drops (0xFD, OLED Diagnostics); a full output queue loses this report's audio, and it isn't counted as sent
+    if (bt_write(pkt, sizeof(pkt))) g_bt_packets = g_bt_packets + 1;
 }
 
 // A report carrying only the narrator: silent haptics, her two frames. For
-// when the host isn't streaming audio (voice_task paces it, 20 ms apart).
+// when the host isn't streaming audio (voice_task paces it, 21.33 ms apart:
+// two 10.67 ms frames, src/report_clock.h).
 void audio_send_voice_report() {
 #if !DISABLE_SPEAKER_PROC
     uint8_t pkt[REPORT_SIZE]{};
@@ -405,8 +511,8 @@ void audio_send_voice_report() {
     pkt[140] = speaker_block_tag();
     pkt[141] = SPEAKER_OPUS_SIZE;
     if (!voice_take_frames(pkt + 142, pkt + 142 + SPEAKER_OPUS_SIZE, SPEAKER_OPUS_SIZE)) return;
-    bt_write(pkt, sizeof(pkt));
-    g_bt_packets++;
+    // error: LOGGED-OK — counter bt_send_drops (0xFD, OLED Diagnostics); a full output queue loses this report's audio, and it isn't counted as sent
+    if (bt_write(pkt, sizeof(pkt))) g_bt_packets = g_bt_packets + 1;
 #endif
 }
 
@@ -456,14 +562,19 @@ static void CORE0_RAM_FUNC(grip_test_task)() {
     const bool tail = !s_grip.active();
     s_grip.fill(reinterpret_cast<int8_t *>(pkt + 12), SAMPLE_SIZE, get_config().haptics_gain,
                 get_config().haptics_gain_right);
+    // The haptic meter shows the test's wave (audio_loop doesn't run without host audio).
+    int hap_max = 0;
+    // loop: HOT-PATH-OK — N = 128 haptic bytes per test report, only during the haptic test
+    for (int i = 0; i < SAMPLE_SIZE * 2; i++) hap_max = std::max(hap_max, std::abs((int) (int8_t) pkt[12 + i]));
+    g_peak_hap.record(peak_from_s8(hap_max), now);
 #if !DISABLE_SPEAKER_PROC
     if (voice_take_frames(pkt + 142, pkt + 142 + SPEAKER_OPUS_SIZE, SPEAKER_OPUS_SIZE)) {
         pkt[140] = speaker_block_tag();
         pkt[141] = SPEAKER_OPUS_SIZE;
     }
 #endif
-    bt_write(pkt, sizeof(pkt));
-    g_bt_packets++;
+    // error: LOGGED-OK — counter bt_send_drops (0xFD, OLED Diagnostics); a full output queue loses this report's audio, and it isn't counted as sent
+    if (bt_write(pkt, sizeof(pkt))) g_bt_packets = g_bt_packets + 1;
     s_grip_clock.sent(now);
     s_grip_tail = !tail && !s_grip.active();
 }
@@ -479,9 +590,21 @@ void CORE0_RAM_FUNC(audio_loop)() {
 
     // 1. 读取 USB 音频数据
     if (!tud_audio_available()) return;
+    // The PC's speaker FIFO (16 ms, overwritable: TinyUSB overwrites the
+    // oldest audio when we fall behind, silently) found full or overrun.
+    // A lower bound: an overrun past twice its size reads as just full.
+    {
+        const tu_fifo_t *out_ff = tud_audio_get_ep_out_ff();
+        // error: LOGGED-OK — counter g_usb_out_overruns (0xFD, OLED Diagnostics "USB ovr"); the main loop fell behind, nothing for the user to do
+        if (out_ff != nullptr && tu_ff_overflow_count(out_ff->depth, out_ff->wr_idx, out_ff->rd_idx) >= out_ff->depth)
+            g_usb_out_overruns = g_usb_out_overruns + 1;
+    }
 
-    int16_t raw[192];
-    uint32_t bytes_read = tud_audio_read(raw, sizeof(raw)); // 每次读入 384 bytes
+    // Up to 4 USB packets (4 ms) per pass, so one slow main-loop pass doesn't
+    // leave the 16-packet FIFO to fill and overwrite; normally there is one.
+    // Static: 1.5 KB is too much for core0's stack.
+    static int16_t raw[192 * 4];
+    uint32_t bytes_read = tud_audio_read(raw, sizeof(raw)); // 每次读入 384 bytes (one packet), up to 4
     int frames = bytes_read / (INPUT_CHANNELS * sizeof(int16_t));
     if (frames == 0) {
         return;
@@ -491,33 +614,62 @@ void CORE0_RAM_FUNC(audio_loop)() {
 
     static float audio_buf[512 * 2];
     static uint audio_buf_pos = 0;
-    // 2. ch3/ch4 are the haptics: every 16th frame becomes a 3 kHz sample.
+    // 2. ch3/ch4 are the haptics: each 16 frames become one 3 kHz sample.
     static HapticDecimator decimator;
     static int8_t haptic_buf[SAMPLE_SIZE];
     static int haptic_buf_pos = 0;
+    // A new stream: drop what the last one left (up to 511 speaker frames and
+    // a partial haptic frame here, two blocks each way in the queues), so the
+    // next sound doesn't start with a fragment of the last one.
+    if (s_spk_stream_opened) {
+        s_spk_stream_opened = false;
+        s_spk_gen = s_spk_gen + 1;
+        audio_buf_pos = 0;
+        haptic_buf_pos = 0;
+        decimator = HapticDecimator{};
+        // loop: HOT-PATH-OK — N ≤ 2 (queue depth), once per stream open
+        while (queue_try_remove(&haptics_fifo, nullptr)) {}
+#if !DISABLE_SPEAKER_PROC
+        // loop: HOT-PATH-OK — N ≤ 2 (queue depth), once per stream open
+        while (queue_try_remove(&audio_fifo, nullptr)) {}
+        // loop: HOT-PATH-OK — N ≤ 2 (queue depth), once per stream open
+        while (queue_try_remove(&audio_spk_fifo, nullptr)) {}
+#endif
+    }
 
     const float audio_gain = mute[0] ? 0.0f : powf(10.0f, get_config().speaker_volume / 20.0f);
     const float haptics_gain = get_config().haptics_gain;             // left grip
     const float haptics_gain_r = get_config().haptics_gain_right;     // right grip
-    // This chunk's peaks: ch1/ch2 for the meter, ch3/ch4 for the meter and
-    // the native-haptics detector below.
-    uint16_t spk_max = 0, native_max = 0;
+    // This chunk's peaks: the game's ch3/ch4 for the native-haptics detector
+    // below; for the meters, what goes out (the speaker samples handed to the
+    // encoder, the int8 haptic samples sent to the controller).
+    uint16_t native_max = 0;
+    float spk_out_max = 0.0f;
+    int hap_out_max = 0;
 
-    // ---- Audio Auto Haptics (borrowed from loteran/DS5Dongle 5d6bc2f) ----
-    // Derives a haptic-feedback waveform from the speaker audio so games that
-    // never write haptic data (e.g. Ghost of Tsushima on Linux+Steam) still
-    // produce rumble. Mode 1 (Fallback, default) fires only when native is
-    // silent → preserves native HD haptics in games that do send them.
+    // Audio Auto Haptics (src/auto_haptics.h). Mode 1 (Fallback) fires only
+    // when native is silent, so it keeps native HD haptics in games that send
+    // them; the default is 0, Off (config.cpp).
     const uint8_t auto_mode = get_config().auto_haptics_enable;
     const float auto_gain   = (auto_mode > 0) ? (get_config().auto_haptics_gain / 100.0f) : 0.0f;
-    static const float LP_COEFF[4] = { 0.01039f, 0.02074f, 0.03095f, 0.05123f };
-    const float lp_a = LP_COEFF[get_config().auto_haptics_lowpass & 3];
-    static float lp_l = 0.0f, lp_r = 0.0f;
-    static float env_l = 0.0f, env_r = 0.0f;
-    constexpr float ENV_ATK = 0.40f;
-    constexpr float ENV_REL = 0.025f;
+    const float lp_a = AutoHaptics::kLowPass[get_config().auto_haptics_lowpass & 3];
+    static AutoHaptics auto_haptics;
     static NativeHapticsPresence native_haptics;
-    const bool fallback_active = (auto_mode == 1) && native_haptics.silent();
+    auto_haptics.set_mode(auto_mode);
+    // The game's haptics peak (Fallback's detector), this chunk's included:
+    // judged from the last chunk, a haptic event's first read was replaced
+    // by derived haptics.
+    // loop: HOT-PATH-OK — N = frames of one USB audio read (≤ 192, normally 48); the game's haptics peak
+    for (int i = 0; i < frames; i++) {
+        int16_t hl = raw[i * INPUT_CHANNELS + 2];
+        int16_t hr = raw[i * INPUT_CHANNELS + 3];
+        const uint16_t a = (uint16_t)(hl < 0 ? -hl : hl);
+        const uint16_t b = (uint16_t)(hr < 0 ? -hr : hr);
+        if (a > native_max) native_max = a;
+        if (b > native_max) native_max = b;
+    }
+    native_haptics.record(native_max, (uint32_t) frames);
+    const bool fallback_active = (auto_mode == kAutoFallback) && native_haptics.silent();
 #if !DISABLE_SPEAKER_PROC
     // No speaker encoder (yet, or core1 couldn't get its memory, issue #15):
     // nothing would take the PCM, so don't convert and queue it only to drop
@@ -531,7 +683,7 @@ void CORE0_RAM_FUNC(audio_loop)() {
     SpeakerMix spk_mix = SpeakerMix::Stereo;
     if (spk_ready) {
         bool l = false, r = false;
-        // loop: HOT-PATH-OK — N = frames of one USB audio read (raw buffer); speaker mono detect
+        // loop: HOT-PATH-OK — N = frames of one USB audio read (≤ 192, normally 48); speaker mono detect
         for (int i = 0; i < frames; i++) {
             l |= raw[i * INPUT_CHANNELS] != 0;
             r |= raw[i * INPUT_CHANNELS + 1] != 0;
@@ -540,43 +692,35 @@ void CORE0_RAM_FUNC(audio_loop)() {
     }
 #endif
 
-    // loop: HOT-PATH-OK — N = frames of one USB audio read; peaks + split, the audio path itself
+    // loop: HOT-PATH-OK — N = frames of one USB audio read (≤ 192, normally 48); peaks + split, the audio path itself
     for (int i = 0; i < frames; i++) {
-        // VU peak tracking
-        {
-            int16_t sl = raw[i * INPUT_CHANNELS];
-            int16_t sr = raw[i * INPUT_CHANNELS + 1];
-            int16_t hl = raw[i * INPUT_CHANNELS + 2];
-            int16_t hr = raw[i * INPUT_CHANNELS + 3];
-            uint16_t a = (uint16_t)(sl < 0 ? -sl : sl);
-            uint16_t b = (uint16_t)(sr < 0 ? -sr : sr);
-            if (a > spk_max) spk_max = a;
-            if (b > spk_max) spk_max = b;
-            a = (uint16_t)(hl < 0 ? -hl : hl);
-            b = (uint16_t)(hr < 0 ? -hr : hr);
-            if (a > native_max) native_max = a;
-            if (b > native_max) native_max = b;
-        }
  #if !DISABLE_SPEAKER_PROC
         // speaker_volume can boost up to +12 dB: speaker_frame clips at full
         // scale rather than hand the encoder samples past +-1.
         if (spk_ready) {
             speaker_frame(raw[i * INPUT_CHANNELS], raw[i * INPUT_CHANNELS + 1], spk_mix, audio_gain,
                           audio_buf[audio_buf_pos], audio_buf[audio_buf_pos + 1]);
+            const float ol = audio_buf[audio_buf_pos], orr = audio_buf[audio_buf_pos + 1];
+            spk_out_max = std::max(spk_out_max, std::max(ol < 0.0f ? -ol : ol, orr < 0.0f ? -orr : orr));
             audio_buf_pos += 2;
             if (audio_buf_pos == 512 * 2) {
                 static audio_raw_element element{};
                 memcpy(element.data, audio_buf, 512 * 2 * 4);
-                if (queue_is_full(&audio_fifo)) {
+                element.gen = s_spk_gen;
+                // Full: drop the oldest and add again. Testing queue_is_full
+                // first raced core1: a block it took in between made the
+                // remove drop a second, good one.
+                // error: LOGGED-OK — counter g_drop_raw below; a full queue drops the oldest block
+                if (!queue_try_add(&audio_fifo, &element)) {
                     queue_try_remove(&audio_fifo,NULL);
                     // error: LOGGED-OK — counter g_drop_raw (0xFB/0xF5, the app's audio counters); realtime audio drops the oldest block, nothing for the user to do
-                    g_drop_raw++;
+                    g_drop_raw = g_drop_raw + 1;
+                    // error: LOGGED-OK — printf + g_drop_raw; only this core adds, so the slot just freed is still free
+                    if (!queue_try_add(&audio_fifo, &element)) {
+                        printf("[Audio] Warning: audio_fifo add failed\n");
+                    }
                 }
-                g_raw_push++;
-                // error: LOGGED-OK — printf + g_drop_raw; the FIFO was just made room for, so this can't fail in practice
-                if (!queue_try_add(&audio_fifo, &element)) {
-                    printf("[Audio] Warning: audio_fifo add failed\n");
-                }
+                g_raw_push = g_raw_push + 1;
                 audio_buf_pos = 0;
             }
         }
@@ -585,35 +729,16 @@ void CORE0_RAM_FUNC(audio_loop)() {
         float h_r = raw[i * INPUT_CHANNELS + 3] / 32768.0f;
 
         if (auto_mode > 0) {
-            const float spk_l = raw[i * INPUT_CHANNELS    ] / 32768.0f;
-            const float spk_r = raw[i * INPUT_CHANNELS + 1] / 32768.0f;
-            lp_l += lp_a * (spk_l - lp_l);
-            lp_r += lp_a * (spk_r - lp_r);
-            const float abs_l = lp_l < 0.0f ? -lp_l : lp_l;
-            const float abs_r = lp_r < 0.0f ? -lp_r : lp_r;
-            env_l = (abs_l > env_l) ? env_l + ENV_ATK * (abs_l - env_l)
-                                    : env_l + ENV_REL * (abs_l - env_l);
-            env_r = (abs_r > env_r) ? env_r + ENV_ATK * (abs_r - env_r)
-                                    : env_r + ENV_REL * (abs_r - env_r);
-            float al = lp_l * (1.0f + 3.0f * env_l) * auto_gain;
-            float ar = lp_r * (1.0f + 3.0f * env_r) * auto_gain;
-            al = al / (1.0f + (al < 0.0f ? -al : al));
-            ar = ar / (1.0f + (ar < 0.0f ? -ar : ar));
-
-            if (auto_mode == 3) {              // Replace
-                h_l = al; h_r = ar;
-            } else if (auto_mode == 2) {       // Mix
-                float m_l = h_l + al, m_r = h_r + ar;
-                h_l = m_l / (1.0f + (m_l < 0.0f ? -m_l : m_l));
-                h_r = m_r / (1.0f + (m_r < 0.0f ? -m_r : m_r));
-            } else if (auto_mode == 1 && fallback_active) {  // Fallback (default)
-                h_l = al; h_r = ar;
-            }
+            float al, ar;
+            auto_haptics.next(raw[i * INPUT_CHANNELS] / 32768.0f, raw[i * INPUT_CHANNELS + 1] / 32768.0f,
+                              lp_a, auto_gain, al, ar);
+            auto_haptics.combine(auto_mode, fallback_active, al, ar, h_l, h_r);
         }
 
-        // 3. 48 kHz -> 3 kHz (Auto Haptics above still sees every frame, its
-        // filters need them). Gain after the rate change, as upstream a55fd46.
-        if (!decimator.take()) continue;
+        // 3. 48 kHz -> 3 kHz, the mean of each 16 frames (src/haptics_decimate.h;
+        // Auto Haptics above sees every frame). Gain after the rate change, as
+        // upstream a55fd46.
+        if (!decimator.push(h_l, h_r)) continue;
         if (s_grip.active()) {  // the haptic feedback test replaces both grips' samples
             s_grip.next(haptic_buf + haptic_buf_pos, haptics_gain, haptics_gain_r);
             haptic_buf_pos += 2;
@@ -621,6 +746,8 @@ void CORE0_RAM_FUNC(audio_loop)() {
             haptic_buf[haptic_buf_pos++] = haptic_to_s8(h_l, haptics_gain);
             haptic_buf[haptic_buf_pos++] = haptic_to_s8(h_r, haptics_gain_r);
         }
+        hap_out_max = std::max(hap_out_max, std::max(std::abs((int) haptic_buf[haptic_buf_pos - 2]),
+                                                     std::abs((int) haptic_buf[haptic_buf_pos - 1])));
 
         // 4. A full 64-byte frame (32 samples x 2 grips) goes to audio_bt_task.
         if (haptic_buf_pos != SAMPLE_SIZE) {
@@ -631,16 +758,15 @@ void CORE0_RAM_FUNC(audio_loop)() {
         if (queue_is_full(&haptics_fifo)) {
             queue_try_remove(&haptics_fifo, NULL);
             // error: LOGGED-OK — counter g_drop_hap (0xFB/0xF5); realtime haptics drop the oldest block
-            g_drop_hap++;
+            g_drop_hap = g_drop_hap + 1;
         }
-        g_hap_push++;
+        g_hap_push = g_hap_push + 1;
         // error: LOGGED-OK — counter g_drop_hap; room was made on the line above, so the add can't fail
         queue_try_add(&haptics_fifo, &element);
         haptic_buf_pos = 0;
     }
-    g_peak_spk.record(spk_max, s_host_audio_us);
-    g_peak_hap.record(native_max, s_host_audio_us);
-    native_haptics.record(native_max);
+    g_peak_spk.record(peak_from_float(spk_out_max), s_host_audio_us);
+    g_peak_hap.record(peak_from_s8(hap_out_max), s_host_audio_us);
     audio_bt_task();
 }
 
@@ -652,6 +778,8 @@ void audio_init() {
     queue_init(&audio_fifo, sizeof(audio_raw_element), 2);
     // lifetime: NOT-WORTH — boot, once per firmware run; the queue lives until reset
     queue_init(&audio_spk_fifo, sizeof(audio_spk_element), 2);
+    // The speaker resampler's filter table, before core1 runs (src/speaker_resample.h).
+    speaker_fir_init();
 #endif
     // Mic queues: core0 fills mic_fifo from BT, core1 decodes into the jitter
     // buffer, core0 drains it to USB. Mic Opus is mono / 48 kHz / 10 ms frames.
@@ -665,45 +793,60 @@ void audio_init() {
 
 #if !DISABLE_SPEAKER_PROC
 static OpusEncoder *encoder;
-static WDL_Resampler resampler_audio;
+static SpeakerResampler resampler_audio;  // core1 only
 
 // Speaker path: USB OUT PCM (core0 audio_fifo) -> resample -> Opus encode ->
 // audio_spk_fifo for audio_bt_task. Non-blocking so core1 can also run the mic.
 static void __not_in_flash_func(speaker_proc)() {
     static audio_raw_element audio_element{};
     if (!queue_try_remove(&audio_fifo, &audio_element)) return;
-    // 将 512 frames 重采样成 480 frames 以解决噪音问题。感谢 @Junhoo
-    WDL_ResampleSample *in_buf;
-    int nframes = resampler_audio.ResamplePrepare(512, 2, &in_buf);
-    // loop: HOT-PATH-OK — N = 512 stereo samples into the resampler, core1 RAM code, no flash
-    for (int i = 0; i < nframes * 2; i++) {
-        in_buf[i] = audio_element.data[i];
+    // A new stream: no history from the last one in the filter.
+    static uint32_t gen = 0;
+    if (audio_element.gen != gen) {
+        gen = audio_element.gen;
+        memset(resampler_audio.buf, 0, sizeof(resampler_audio.buf));
     }
-    static WDL_ResampleSample out_buf[480 * 2];
-    resampler_audio.ResampleOut(out_buf, nframes, 480, 2);
+    // 将 512 frames 重采样成 480 frames 以解决噪音问题。感谢 @Junhoo
+    // A polyphase FIR (src/speaker_resample.h), no longer linear interpolation.
+    static float out_buf[480 * 2];
+    resampler_audio.process(audio_element.data, out_buf);
 
     static audio_spk_element spk{};
     // error: LOGGED-OK — the block is skipped (a 10 ms gap); an encode error needs a broken encoder, which core1 flags at start (g_c1_flags 0x02, shown in the app's Dongle dashboard)
     const int encoded = opus_encode_float(encoder, out_buf, 480, spk.data, SPEAKER_OPUS_SIZE);
     if (encoded <= 0) return;
-    g_c1_enc++;
+    g_c1_enc = g_c1_enc + 1;
     if (encoded < SPEAKER_OPUS_SIZE) memset(spk.data + encoded, 0, SPEAKER_OPUS_SIZE - encoded);
-    if (queue_is_full(&audio_spk_fifo)) {
+    // The PC restarted its stream while this block was encoding: core0 has
+    // flushed the queue, so don't play the old stream's fragment after it.
+    // error: NOT-WORTH — not a failure: a stale block from a stream that ended
+    if (audio_element.gen != s_spk_gen) return;
+    // Full: drop the oldest and add again (testing queue_is_full first raced
+    // core0's audio_bt_task, which could take one in between).
+    // error: LOGGED-OK — counter g_drop_enc below; a full queue drops the oldest packet
+    if (!queue_try_add(&audio_spk_fifo, &spk)) {
         queue_try_remove(&audio_spk_fifo, NULL);
         // error: LOGGED-OK — counter g_drop_enc (0xF5); realtime speaker drops the oldest packet
-        g_drop_enc++;
+        g_drop_enc = g_drop_enc + 1;
+        // error: NOT-WORTH — only core1 adds, so the slot just freed is still free
+        queue_try_add(&audio_spk_fifo, &spk);
     }
-    // error: LOGGED-OK — counted on the line above; room was just made, so the add can't fail
-    queue_try_add(&audio_spk_fifo, &spk);
 }
 #endif
 
 static OpusDecoder *mic_decoder = nullptr;
 
 static void __not_in_flash_func(mic_push_decoded)(const mic_decoded_element &dec) {
-    if (queue_is_full(&mic_decode_fifo)) queue_try_remove(&mic_decode_fifo, NULL);
-    // error: LOGGED-OK — counted on the line above; room was just made, so the add can't fail
-    queue_try_add(&mic_decode_fifo, &dec);
+    // Full: drop the oldest and add again (testing queue_is_full first raced
+    // core0's mic_drain, which could take one in between).
+    // error: LOGGED-OK — counter g_mic_buf_drops below; a full jitter buffer drops the oldest frame
+    if (!queue_try_add(&mic_decode_fifo, &dec)) {
+        queue_try_remove(&mic_decode_fifo, NULL);
+        // error: LOGGED-OK — counter g_mic_buf_drops (0xFD, OLED Diagnostics "Mic b"); a drop is a glitch, not a user action
+        g_mic_buf_drops = g_mic_buf_drops + 1;
+        // error: NOT-WORTH — only core1 adds, so the slot just freed is still free
+        queue_try_add(&mic_decode_fifo, &dec);
+    }
 }
 
 // Mic path: Opus from the controller (mic_fifo) -> decode -> jitter buffer.
@@ -724,7 +867,7 @@ static bool __not_in_flash_func(mic_proc)() {
             mic_push_decoded(dec);
             g_mic_last_real_us = now;
             g_mic_session = true;
-            g_mic_frames++;
+            g_mic_frames = g_mic_frames + 1;
             last_out_us = now;
         }
         return true;
@@ -739,7 +882,7 @@ static bool __not_in_flash_func(mic_proc)() {
     const int n = opus_decode(mic_decoder, nullptr, 0, dec.mono, MIC_FRAMES, 0); // PLC
     if (n > 0) {
         mic_push_decoded(dec);
-        g_mic_plc_frames++;
+        g_mic_plc_frames = g_mic_plc_frames + 1;
     }
     last_out_us += mic_session::kFrameUs;
     return true;
@@ -786,11 +929,6 @@ void __not_in_flash_func(core1_entry)() {
         opus_encoder_ctl(encoder,OPUS_SET_VBR(false));
         // error: NOT-WORTH — nothing; constant, valid encoder settings on an encoder that was just created
         opus_encoder_ctl(encoder,OPUS_SET_COMPLEXITY(0)); // max 4
-        resampler_audio.SetMode(true, 0, false);
-        resampler_audio.SetRates(51200, 48000);
-        resampler_audio.SetFeedMode(true);
-        // lifetime: OK — once at core1 start, sized for audio_loop's 512-in/480-out frame, so it never grows
-        resampler_audio.Prealloc(2, 512, 480);
         g_spk_ready = true;
     }
     g_c1_stage = 6;
@@ -809,7 +947,7 @@ void __not_in_flash_func(core1_entry)() {
     // loop: HOT-PATH-OK — core1 service loop: bounded work per item, sleep_us(10) when idle
     while (true) {
         g_c1_stage = 9;  // running: stage 9 and c1_loops moving
-        g_c1_loops++;
+        g_c1_loops = g_c1_loops + 1;
         bool work = false;
 #if !DISABLE_SPEAKER_PROC
         if (g_spk_ready && !queue_is_empty(&audio_fifo)) {

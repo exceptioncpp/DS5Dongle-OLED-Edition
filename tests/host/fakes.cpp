@@ -55,6 +55,7 @@ bool g_fake_bt_connected = false;
 int g_fake_slot = 0;
 bool bt_is_connected() { return g_fake_bt_connected; }
 uint32_t bt_hci_err_count() { return 0; }
+uint32_t bt_send_drops() { return 0x05060708; }
 bool g_fake_rssi_valid = true;
 int8_t g_fake_rssi = -8;
 bool bt_get_signal_strength(int8_t *rssi) { *rssi = g_fake_rssi; return g_fake_rssi_valid; }
@@ -126,6 +127,10 @@ uint32_t audio_mic_plc_frames() { return 11; }
 uint32_t audio_mic_level_drops() { return 0x01020304; }
 uint8_t audio_mic_level() { return 4; }
 uint8_t audio_mic_level_max() { return 6; }
+uint32_t audio_mic_in_drops() { return 0x00011234; }  // 0xFD sends the low 16 bits
+uint32_t audio_mic_buf_drops() { return 0x5678; }
+uint32_t audio_mic_underruns() { return 0x9ABC; }
+uint32_t audio_usb_out_overruns() { return 0xDEF0; }
 uint8_t audio_peak_speaker() { return 12; }
 uint8_t audio_peak_haptic() { return 13; }
 GripWave g_fake_grip;
@@ -155,6 +160,17 @@ int g_fake_identify_tenths = -1;
 int g_fake_identify_calls = 0;
 void oled_identify(uint8_t tenths) { g_fake_identify_tenths = tenths; g_fake_identify_calls++; }
 bool oled_identify_active() { return g_fake_identify_tenths > 0; }
+// oled.cpp's display driven since boot, board_facts.cpp's boot-time reads (0xEA, proto 1.21).
+uint8_t g_fake_display_active = 1;
+uint8_t oled_display_active() { return g_fake_display_active; }
+#include "board_facts.h"
+#include "fw_identity.h"
+uint8_t g_fake_flash_measured = 0x0A;
+uint8_t g_fake_chip = 1;
+uint8_t board_flash_built() { return fwid::flash_code(PICO_FLASH_SIZE_BYTES); }
+uint8_t board_flash_measured() { return g_fake_flash_measured; }
+uint8_t board_chip() { return g_fake_chip; }
+bool board_saved_state_off() { return fwid::saved_state_off(board_flash_built(), g_fake_flash_measured); }
 #include "pico/unique_id.h"
 uint8_t g_fake_board_id[8] = {0xE6, 0x61, 0x38, 0x52, 0x83, 0x4A, 0x2B, 0x2C};
 void pico_get_unique_board_id(pico_unique_board_id_t *id) { std::memcpy(id->id, g_fake_board_id, 8); }

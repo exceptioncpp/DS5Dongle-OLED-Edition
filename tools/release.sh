@@ -3,7 +3,9 @@
 # one tag (vX.Y.Z-oled-edition) on both repos. The tag push starts
 # .github/workflows/release.yml here, which builds the firmware, builds the
 # app for every OS with that firmware bundled, publishes one release with
-# everything attached, and refreshes latest.json.
+# everything attached. The update feeds (latest.json, latest-dev.json) are
+# signed only on this PC: once the release is published, run
+# tools/publish_feed.sh.
 #
 #   tools/release.sh 0.8.0 [--app ../DS5Dongle-OLED-Config-Web]
 #   tools/release.sh 0.9.1-dev.1      a development build: a GitHub pre-release,
@@ -52,6 +54,11 @@ DEV=false
 toolchain_setup || die "no usable Pico SDK / ARM toolchain"
 [ -f "$APP_DIR/package.json" ] || die "app repo not found at $APP_DIR (use --app PATH)"
 
+# Each repo's origin must be the GitHub repo it publishes to: the tags and
+# master go to origin, and release.yml runs on MarcelineVPQ/DS5Dongle-OLED-Edition.
+origin_is() { [[ "$(git -C "$1" remote get-url origin)" =~ [:/]$2(\.git)?$ ]] || die "$1: origin is not $2 ($(git -C "$1" remote get-url origin))"; }
+origin_is "$FW_DIR" MarcelineVPQ/DS5Dongle-OLED-Edition
+origin_is "$APP_DIR" MarcelineVPQ/DS5Dongle-OLED-Config-Web
 for dir in "$FW_DIR" "$APP_DIR"; do
   [ "$(git -C "$dir" branch --show-current)" = master ] || die "$dir is not on master"
   [ -z "$(git -C "$dir" status --porcelain --untracked-files=no)" ] || die "$dir has uncommitted changes"
@@ -82,21 +89,23 @@ if [ "$DEV" = true ]; then
 fi
 
 echo "== App checks"
-(cd "$APP_DIR" && npm run check)
+# DS5_FIRMWARE_REPO: the app's board table is checked against this repo's boards.json
+(cd "$APP_DIR" && DS5_FIRMWARE_REPO="$FW_DIR" npm run check)
 echo "== Doc gates on both repos: CHANGELOG, file references, one version, no secret project's name (the app's tools/doc_gates.mjs)"
 (cd "$APP_DIR" && node tools/doc_gates.mjs --check --firmware "$FW_DIR" && node tools/doc_gates.mjs --check --repo "$FW_DIR")
-echo "== Firmware checks: submodule gitlinks, the 7 READMEs, host unit tests"
+echo "== Firmware checks: submodule gitlinks, the 7 READMEs, the community files, host unit tests"
 "$FW_DIR/tools/check_gitlinks.sh" "$FW_DIR"
 python3 "$FW_DIR/tools/check_readmes.py" "$FW_DIR"
+python3 "$FW_DIR/tools/check_community.py" "$FW_DIR"
 (cd "$APP_DIR" && node tools/check_identical_files.mjs "$FW_DIR")
+python3 "$FW_DIR/tools/check_protocol_lockstep.py" "$APP_DIR"
 BUILD_DIR="$(mktemp -d)"
 trap 'rm -rf "$BUILD_DIR"' EXIT
 "$FW_DIR/tests/host/run.sh" "$BUILD_DIR/host-tests"
-echo "== Firmware build check (release configuration)"
-cmake -S "$FW_DIR" -B "$BUILD_DIR" -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_COMPANION_VENDOR=ON -DVERSION="$TAG" >/dev/null
-cmake --build "$BUILD_DIR" --target ds5-bridge >/dev/null
-"$FW_DIR/tools/check_ram_residency.sh" "$BUILD_DIR/ds5-bridge-oled.elf"
-"$FW_DIR/tools/check_xip_setup.sh" "$BUILD_DIR/ds5-bridge-oled.elf" 2 11
+echo "== Firmware build check: every release board in boards.json, as release.yml builds it (tools/build_board.sh, gate G2)"
+for board in $(node -p 'require(process.argv[1]).boards.filter((b) => b.release).map((b) => b.id).join(" ")' "$FW_DIR/boards.json"); do
+  DS5_OUT_DIR="$BUILD_DIR" "$FW_DIR/tools/build_board.sh" "$board" "$TAG" -DENABLE_COMPANION_VENDOR=ON >/dev/null
+done
 
 if [ "$DEV" = true ]; then
   echo "== CHANGELOGs: [Unreleased] becomes [$VERSION]"
@@ -131,3 +140,4 @@ git -C "$FW_DIR" tag -a "$TAG" -m "DS5 Dongle OLED Edition $TAG"
 git -C "$FW_DIR" push origin master "$TAG"
 
 echo "Pushed. Watch: gh run watch -R MarcelineVPQ/DS5Dongle-OLED-Edition"
+echo "When the release is published, sign and publish the update feeds: tools/publish_feed.sh"

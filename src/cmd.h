@@ -11,6 +11,13 @@ bool is_pico_cmd(uint8_t report_id);
 bool is_debug_cmd(uint8_t report_id);  // 0xF2-0xF4, read-only
 uint16_t pico_cmd_get(uint8_t report_id, uint8_t *buffer,uint16_t reqlen);
 void pico_cmd_set(uint8_t report_id, uint8_t const *buffer,uint16_t bufsize);
+// The same from the game-facing HID interface (SET_FEATURE): any program with
+// the DualSense's hidraw node open can send it, so outside ENABLE_SERIAL
+// builds it refuses the functions that unpair controllers or erase settings
+// (0x05 forget slot, 0x06 wipe slots, 0x09 factory reset; INVALID in 0xF1).
+// The app uses the vendor interface; BOOTSEL (0x08) stays for
+// tools/bootsel.py and loses nothing.
+void pico_cmd_set_hid(uint8_t report_id, uint8_t const *buffer, uint16_t bufsize);
 
 // Configurator protocol (identity report 0xF1, vendor interface only).
 #define PICO_CMD_IDENTITY 0xf1
@@ -21,7 +28,8 @@ void pico_cmd_set(uint8_t report_id, uint8_t const *buffer,uint16_t bufsize);
 #define PICO_CMD_REMAP_EXTRA 0xed // vendor interface only, GET, Edge extra-button remap (proto 1.9)
 #define PICO_CMD_CALIB 0xee       // vendor interface only, GET, calibration body (proto 1.5)
 #define PICO_CMD_OLED_MIRROR 0xef // vendor interface only, GET, 1028 bytes (proto 1.4)
-#define PICO_PROTO_MINOR 20
+#define PICO_CMD_FW_IDENTITY 0xea // vendor interface only, GET, firmware identity (proto 1.21, fw_identity.h)
+#define PICO_PROTO_MINOR 22
 
 // 0xFE mic-debug dump: frame bytes kept of the longest 0x31 seen, so the
 // reply (2 length bytes + these) fits the 63-byte cap.

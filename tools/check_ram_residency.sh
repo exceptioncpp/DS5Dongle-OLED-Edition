@@ -4,7 +4,8 @@
 #   1. No __memcpy_chk / __memset_chk / __memmove_chk (libopus fortify put
 #      them in flash, so core1 left RAM every frame).
 #   2. Core1's entry, its frame functions, the libopus encode/decode entry
-#      points, the two WDL_Resampler hot methods, the SDK queue ops and our
+#      points, the speaker resampler (src/speaker_resample.h, inlined unless
+#      the compiler keeps a copy), the SDK queue ops and our
 #      memcpy/memset/memmove all sit in SRAM (0x20000000-0x20080000).
 #      A symbol the build doesn't have (the Pico W build has no speaker
 #      encoder) is skipped; the always-present ones must exist.
@@ -17,6 +18,7 @@
 #      builds only: the Pico W (RP2040) keeps core0 in flash (src/core0_ram.h).
 #      Inline per-frame helpers (src/haptics_decimate.h, src/grip_wave.h) are
 #      checked only if the compiler kept an out-of-line copy.
+#   4. Core1's RAM code calls nothing new in flash (tools/check_core1_calls.py).
 #   Run by .github/workflows/build.yml and release.yml after each build.
 #   tools/check_ram_residency.sh path/to/ds5-bridge.elf
 set -euo pipefail
@@ -35,7 +37,7 @@ in_ram() { local a=$((16#$1)); (( a >= 0x20000000 && a < 0x20080000 )); }
 # the SDK's ROM wrappers on RP2040 (no symbol of that name), ours on RP2350.
 REQUIRED="_Z11core1_entryv memmove queue_try_add queue_try_remove opus_decode celt_decode_with_ec"
 OPTIONAL="memcpy memset opus_encode_float opus_encode_native celt_encode_with_ec
-  _ZN13WDL_Resampler11ResampleOutEPfiii _ZN13WDL_Resampler15ResamplePrepareEiiPPf"
+  _ZN16SpeakerResampler7processEPKfPf"
 for sym in $REQUIRED $OPTIONAL; do
   addr="$(awk -v s="$sym" '$3 == s && $2 ~ /^[tTwW]$/ {print $1; exit}' <<<"$SYMS")"
   if [ -z "$addr" ]; then
@@ -55,7 +57,7 @@ CORE0=""
 [ -n "$top" ] && (( 16#$top > 0x20042000 )) && CORE0="
   bt.cpp:_ZL18hci_packet_handlerhtPht bt.cpp:_ZL20l2cap_packet_handlerhtPht
   _Z8bt_writePKht _Z14interrupt_loopv _Z10on_bt_data12CHANNEL_TYPEPht
-  hci.c:packet_handler l2cap.c:l2cap_acl_handler
+  hci.c:hci_transport_packet_handler l2cap.c:l2cap_acl_handler
   tu_fifo_read_n_access_mode tu_fifo_write_n_access_mode
   cyw43_spi_transfer cyw43_read_bytes cyw43_write_bytes
   cyw43_read_reg_u32 cyw43_read_reg_u16 cyw43_read_reg_u8
@@ -75,20 +77,23 @@ CORE0=""
   btstack_run_loop_base_poll_data_sources btstack_run_loop_poll_data_sources_from_irq
   l2cap_request_can_send_now_event btstack_linked_list_iterator_init
   btstack_linked_list_iterator_has_next btstack_linked_list_iterator_next
-  crc32_lookup_table _Z10audio_loopv audio.cpp:_ZL13audio_bt_taskv _Z13mic_add_queuePKh
+  crc32_lookup_table _Z10audio_loopv audio.cpp:_ZL13audio_bt_taskv audio.cpp:_ZL18send_single_reportb _Z13mic_add_queuePKh
 "
 # Inline helpers audio_loop calls per frame (src/haptics_decimate.h,
-# src/audio_levels.h, src/mic_level.h, and the haptic feedback test's grip_test_task with
+# src/audio_levels.h, src/auto_haptics.h, src/mic_level.h, and the haptic feedback test's grip_test_task with
 # src/grip_wave.h): normally folded into audio_loop, but an out-of-line copy
 # must be in RAM too. TinyUSB 0.21's single-item tu_fifo_read / tu_fifo_write
 # have no caller in this firmware (the linker drops them); renamed anyway, so checked if linked.
+# btstack in pico-sdk 2.3.1: the transport calls hci_transport_packet_handler,
+# whose one call to packet_handler the compiler may inline (both renamed).
 CORE0_OPTIONAL=""
-[ -n "$CORE0" ] && CORE0_OPTIONAL="_ZN15HapticDecimator4takeEv _Z12haptic_to_s8ff tu_fifo_read tu_fifo_write
+[ -n "$CORE0" ] && CORE0_OPTIONAL="hci.c:packet_handler _ZN15HapticDecimator4pushERfS0_ _Z12haptic_to_s8ff tu_fifo_read tu_fifo_write
   audio.cpp:_ZL14grip_test_taskv _ZN8GripWave4nextEPaff _ZN8GripWave4fillEPaiff _ZNK8GripWave6activeEv
   _ZN16AudioReportClock3dueEy _ZN16AudioReportClock4sentEy _ZN16AudioReportClock5resetEv
-  _ZNK21NativeHapticsPresence6silentEv _ZN21NativeHapticsPresence6recordEt
+  _ZNK21NativeHapticsPresence6silentEv _ZN21NativeHapticsPresence6recordEtm
+  _ZN11AutoHaptics4nextEffffRfS0_ _ZN11AutoHaptics7combineEhbffRfS0_ _ZN11AutoHaptics8set_modeEh _Z9mix_limitf
   _ZNK9AudioPeak5levelEy _ZN9AudioPeak6recordEty
-  _ZN8MicLevel6sampleEji _ZN8MicLevel4dropEji _Z14mic_frame_peakPKsi"
+  _ZN8MicLevel6sampleEmi _ZN8MicLevel4dropEmi _Z14mic_frame_peakPKsi _Z10mic_splicePKsPsi"
 # FUNC/OBJECT symbols as "file:name addr" (locals, grouped after their FILE
 # entry) and "name addr" (globals and weak), one per line.
 TABLE="$("$READELF" -sW "$ELF" | awk '
@@ -112,6 +117,9 @@ for sym in $CORE0_OPTIONAL; do
     bad=1
   fi
 done
+# 4. What core1's RAM code calls: no new call into flash (tools/check_core1_calls.py,
+#    which walks the calls from core1_entry; its allow-list names each known one).
+OBJDUMP="${OBJDUMP:-arm-none-eabi-objdump}" python3 "$(dirname "$0")/check_core1_calls.py" "$ELF" || bad=1
 if [ "$bad" = 0 ]; then
   if [ -n "$CORE0" ]; then
     echo "check_ram_residency: core1's audio path and core0's BT/USB hot path are RAM-resident"

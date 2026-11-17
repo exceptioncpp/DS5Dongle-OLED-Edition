@@ -20,6 +20,9 @@
 #include "oled.h"
 #include "oled_vpad.h"
 #include "identify_screen.h"
+#include "board_facts.h"
+#include "display_table.h"
+#include "fw_identity.h"
 #include "pico/unique_id.h"
 #include "state_mgr.h"
 #include "hardware/clocks.h"
@@ -125,6 +128,9 @@ static uint8_t s_pending_arg = 0;
 static uint8_t s_pending_arg2 = 0;  // 0x0E: the duration in tenths (0 = stop)
 static uint16_t s_pending_hold_ms = 0;  // 0x19: how long the virtual button is held
 static uint64_t s_pending_due_us = 0;
+static uint8_t s_pending_buf[64];  // 0x0D / 0x10 / 0x13 / 0x14: the SET to run from cmd_task()
+static uint16_t s_pending_len = 0;
+static void run_table_cmd(uint8_t const *buffer, uint16_t bufsize);
 
 uint32_t cmd_host_config_gen() { return s_host_gen; }
 
@@ -313,6 +319,10 @@ void cmd_task() {
             result = config_save_power_flags(s_pending_arg) ? CMD_RESULT_OK : CMD_RESULT_FAILED;
             s_host_gen++;
             break;
+        case 0x1B: // display choice (proto 1.21), saved on its own like the power flags; used from the next start
+            // error: SHOWN — CMD_RESULT_FAILED in the 0xF1 result byte, the app's command error (save failed)
+            result = config_save_display_id(s_pending_arg) ? CMD_RESULT_OK : CMD_RESULT_FAILED;
+            break;
         case 0x18: // remote KEY0 / KEY1 press (proto 1.18): bit0 key, bit1 long
             // error: SHOWN — CMD_RESULT_BUSY in the 0xF1 result byte: four presses already waiting; the app shows a command error
             result = oled_key_inject(s_pending_arg & 1, (s_pending_arg & 2) != 0) ? CMD_RESULT_OK : CMD_RESULT_BUSY;
@@ -320,6 +330,13 @@ void cmd_task() {
         case 0x19: // virtual controller button for the OLED screens (proto 1.19)
             // error: SHOWN — CMD_RESULT_BUSY in the 0xF1 result byte: four presses already waiting (button and hold were checked at the SET); the app shows a command error
             result = oled_pad_inject(s_pending_arg, s_pending_hold_ms) ? CMD_RESULT_OK : CMD_RESULT_BUSY;
+            break;
+        case 0x0D: // calibration, remap, Edge extras, stick curves: they save to flash
+        case 0x10:
+        case 0x13:
+        case 0x14:
+            run_table_cmd(s_pending_buf, s_pending_len);
+            result = s_last_result;  // OK, or INVALID / FAILED with its reason (run_table_cmd)
             break;
         default:
             // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: unknown function, the app's command error
@@ -398,7 +415,11 @@ uint16_t pico_cmd_get(uint8_t report_id, uint8_t *buffer, uint16_t reqlen) {
     //   controller's VolumeMic 0..0x40 (what mic_level 0 follows)
     //   proto 1.20 (when reqlen >= 50): [49] feature bits 4, bit0 board id,
     //   bit1 identify screen (0xF6 0x1A); (when reqlen >= 58) [50..57] the
-    //   board's flash unique id, the same whatever controller is paired
+    //   board's flash unique id, the same whatever controller is paired;
+    //   bit2 (1.21) firmware identity (GET 0xEA, fw_identity.h); bit3 (1.21)
+    //   the display choice (0xF6 0x1B); bit4 (1.22) polling_rate_mode 3 =
+    //   1000 Hz; bit5 (1.22) the config body's packet_mode (byte 51); bit6
+    //   (1.22) the config body's disconnect_on_dock (byte 52, body 53)
     //   proto 1.14 (when reqlen >= 48): [47] the PC sleep options' current
     //   bits (POWER_*: bit0 controller off when the PC sleeps, bit1 PS wakes
     //   the PC; 0 when [46] bit2 is clear)
@@ -438,6 +459,26 @@ uint16_t pico_cmd_get(uint8_t report_id, uint8_t *buffer, uint16_t reqlen) {
         memcpy(buffer + 5, saved, sizeof(saved));
         memcpy(buffer + 5 + sizeof(saved), active, sizeof(active));
         return kLen;
+    }
+    // 0xEA (vendor interface only, proto 1.21): the firmware identity, layout
+    // in fw_identity.h (14 bytes).
+    if (report_id == PICO_CMD_FW_IDENTITY) {
+        const uint8_t active = oled_display_active();
+        const fwid::Facts f{
+            .board_type = DS5_BOARD_TYPE_ID,
+            .persona = fwid::kPersonaDs5,
+            .personas = 1u << fwid::kPersonaDs5,
+            .flash_built = board_flash_built(),
+            .flash_measured = board_flash_measured(),
+            .chip = board_chip(),
+            // The radio is always found here: without it the board stops at boot (radio_boot.h).
+            .flags = (uint8_t) (fwid::kFlagRadio | (board_saved_state_off() ? fwid::kFlagSavedStateOff : 0) |
+                                (display::has_panel(active) ? fwid::kFlagDisplay : 0)),
+            .display_active = active,
+            .displays = display::kSupported,
+            .display_saved = config_display_id(),
+        };
+        return fwid::write(f, buffer, reqlen);
     }
     if (report_id == PICO_CMD_REMAP_EXTRA) {
         // error: NOT-WORTH — no data (not a STALL: the HID path answers only the report id, the vendor interface a zero-length reply); a request shorter than the reply (the app always asks the full length, its transport reports a short reply)
@@ -539,8 +580,12 @@ uint16_t pico_cmd_get(uint8_t report_id, uint8_t *buffer, uint16_t reqlen) {
         buffer[48] = state_get_pc_mic_volume();
         if (reqlen < 50) return 49;
         // proto 1.20: [49] a fourth feature byte. bit0 the board id at
-        // [50..57]; bit1 the identify screen (0xF6 0x1A).
-        buffer[49] = 0x01 | 0x02;
+        // [50..57]; bit1 the identify screen (0xF6 0x1A); bit2 (1.21) the
+        // firmware identity (GET 0xEA); bit3 (1.21) the display choice (0xF6 0x1B).
+        // bit4 (1.22): polling_rate_mode 3 = 1000 Hz (2 stays real-time).
+        // bit5 (1.22): the config body's packet_mode (byte 51: 0x39 or 0x36 audio reports).
+        // bit6 (1.22): the config body's disconnect_on_dock (byte 52, body 53).
+        buffer[49] = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x40;
         if (reqlen < 50 + kBoardIdLen) return 50;
         // proto 1.20: [50..57] the board's flash unique id (the RP2350's /
         // RP2040's 64-bit id, pico_get_unique_board_id): stable whatever
@@ -767,9 +812,19 @@ uint16_t pico_cmd_get(uint8_t report_id, uint8_t *buffer, uint16_t reqlen) {
         //   [44..47] uint32  frames the level control dropped since boot
         //   [48]     uint8   frames queued at the last frame boundary (x 10 ms)
         //   [49]     uint8   the highest level this mic session
-        // Hosts asking for 44 bytes get exactly what they did before.
-        constexpr uint16_t want = 50;
-        // loop: NOT-WORTH — ≤ 50 bytes zeroed, per 0xFD diagnostic GET
+        // Section 4: Bluetooth output queue (added after 0.9.5-dev.20).
+        //   [50..53] uint32  output reports dropped since boot because the
+        //                    queue was full (speaker/haptics 0x39, mic 0x32,
+        //                    state 0x31); not in "BT audio reports out" (0xF5)
+        // Section 5: audio lost elsewhere (after section 4), u16 each, the
+        //   low 16 bits of a count since boot (they wrap: take differences).
+        //   [54..55] mic Opus packets dropped, mic_fifo full (core1 behind)
+        //   [56..57] decoded mic frames dropped, the jitter buffer full
+        //   [58..59] 1 ms silent mic slices while playing (jitter buffer empty)
+        //   [60..61] times the PC's speaker FIFO was found full or overrun
+        // Hosts asking for 44, 50 or 54 bytes get exactly what they did before.
+        constexpr uint16_t want = 62;
+        // loop: NOT-WORTH — ≤ 62 bytes zeroed, per 0xFD diagnostic GET
         for (uint16_t i = 0; i < want && i < reqlen; i++) buffer[i] = 0;
 
         const uint32_t bt31    = g_bt_31_packets;
@@ -800,6 +855,11 @@ uint16_t pico_cmd_get(uint8_t report_id, uint8_t *buffer, uint16_t reqlen) {
         if ((44 + 4) <= reqlen) memcpy(buffer + 44, &mic_drops, 4);
         if (48 < reqlen) buffer[48] = audio_mic_level();
         if (49 < reqlen) buffer[49] = audio_mic_level_max();
+        const uint32_t bt_drops = bt_send_drops();
+        if ((50 + 4) <= reqlen) memcpy(buffer + 50, &bt_drops, 4);
+        const uint16_t lost[4] = {(uint16_t) audio_mic_in_drops(), (uint16_t) audio_mic_buf_drops(),
+                                  (uint16_t) audio_mic_underruns(), (uint16_t) audio_usb_out_overruns()};
+        if ((54 + 8) <= reqlen) memcpy(buffer + 54, lost, 8);
         return (reqlen < want) ? reqlen : want;
     }
     if (report_id == 0xfe) {
@@ -824,185 +884,47 @@ uint16_t pico_cmd_get(uint8_t report_id, uint8_t *buffer, uint16_t reqlen) {
     return 0;
 }
 
-void pico_cmd_set(uint8_t report_id, uint8_t const *buffer, uint16_t bufsize) {
-    // Only 0xF6 carries commands; the other ids are read-only status reports.
-    if (report_id != PICO_CMD_SET || bufsize == 0) {
+void pico_cmd_set_hid(uint8_t report_id, uint8_t const *buffer, uint16_t bufsize) {
+#if !ENABLE_SERIAL
+    const bool destructive = bufsize > 0 && (buffer[0] == 0x05 || buffer[0] == 0x06 || buffer[0] == 0x09);
+    // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte (and a printf): unpairing / erasing is refused on the game-facing HID interface (review fw-usb-bt N7); the app sends these over the vendor interface
+    if (report_id == PICO_CMD_SET && destructive && !s_pending) {
+        printf("[CMD] 0x%02X refused on the HID interface\n", buffer[0]);
+        s_cmd_seq++;
+        s_last_func = buffer[0];
+        // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: refused on this interface (above)
+        s_last_result = CMD_RESULT_INVALID;
         return;
     }
+#endif
+    pico_cmd_set(report_id, buffer, bufsize);
+}
 
-    const uint8_t func = buffer[0];
-    const uint8_t arg = bufsize >= 2 ? buffer[1] : 0xFF;
-    s_cmd_seq++;
-
-    s_last_func = func;
-
-    // While a deferred function is waiting to run in cmd_task(), every other
-    // SET is refused with BUSY (a host must wait for 0xF1 to leave PENDING
-    // first); cmd_task() reports the deferred one's result under its own id.
-    if (s_pending) {
-        // error: SHOWN — CMD_RESULT_BUSY in the 0xF1 result byte: a deferred command is still pending; the app waits for 0xF1 first and shows a command error if it ever sees BUSY
-        s_last_result = CMD_RESULT_BUSY;
-        return;
-    }
-    const bool deferred = func == 0x02 || (func >= 0x04 && func <= 0x0B) || func == 0x17 || func == 0x18 || func == 0x19;
-
-    //   0x01 update config in RAM          0x02 write config to flash (deferred)
-    //   0x03 reconnect tinyusb device      0x04 [slot] switch slot (deferred)
-    //   0x05 [slot] forget slot            0x06 wipe all slots
-    //   0x07 reboot                        0x08 reboot into BOOTSEL
-    //   0x09 factory reset + save          0x0A [preset] trigger preset preview
-    //   0x0B [v] narrator: 0xFF off, 1..7 language; saved (deferred)
-    //   0x0C [line][lang] say a narrator line now (app preview)
-    //   0x0D calibration (below)           0x10 remap table (below)
-    //   0x0E [side][tenths] grip test: side 0 left, 1 right, 2 both; held
-    //        steadily for tenths x 0.1 s (no byte: 0.5 s; 0 stops; max 5 s);
-    //        a new one replaces the running one (deferred)
-    //   0x11 remap table for now (below)   0x12 back to the saved remap table
-    //                                         (and the saved stick curves)
-    //   0x13 Edge extra buttons (below)    0x14 stick response curves (below)
-    //   0x15 reset the timing counters (0xFC [11..62], proto 1.11)
-    //   0x16 [dev][action][pages] run a controller test command (proto 1.12,
-    //        ctrl_info.cpp; read the answer with GET 0xEB)
-    //   0x17 [flags] PC sleep options (proto 1.14): bit0 controller off when
-    //        the PC sleeps, bit1 PS button wakes the PC; saved (deferred)
-    //   0x18 [key][press] remote OLED key press (proto 1.18): key 0 KEY0,
-    //        1 KEY1; press 0 short, 1 long; played through handle_buttons()
-    //        like the board's keys, OLED wired or not (deferred; BUSY when
-    //        four presses are already waiting)
-    //   0x19 [button][hold lo][hold hi] virtual controller button for the
-    //        OLED screens (proto 1.19): button 0 up, 1 down, 2 left, 3 right,
-    //        4 triangle, 5 circle, 6 cross, 7 square, 8 R1; hold in ms, 0 or
-    //        absent = a tap, up to 5000. Only the OLED's input handling sees
-    //        it, never the PC's report (deferred; BUSY when four wait)
-    //   0x1A [tenths] identify (proto 1.20): the OLED shows "THIS ONE" with
-    //        the board name and slot, flashing, at full brightness for
-    //        tenths x 0.1 s (no byte: 3 s; 0 stops; max 10 s), and the LED
-    //        blinks in step; then both go back to what they were
-    s_last_result = CMD_RESULT_OK;
-    switch (func) {
-        case 0x01:
-            printf("[CMD] Enter config set func\n");
-        {
-            // The active slot only changes through 0x04 (bt_set_slot): a host
-            // writing a config it read earlier must not move it back.
-            Config_body body = get_config();
-            const uint16_t n = bufsize - 1 < sizeof(body) ? bufsize - 1 : sizeof(body);
-            memcpy(&body, buffer + 1, n);
-            body.current_slot = (uint8_t) bt_get_slot();
-            set_config((const uint8_t *) &body, sizeof(body));
-        }
-            s_host_gen++;
-            break;
-        case 0x02:
-            defer(func, 0, 0);
-            break;
-        case 0x03:
-            printf("[CMD] Enter tud reconnect func\n");
-            usb_power_reconnect();  // a deliberate reconnect, not a PC sleep
-            break;
-        case 0x04:
-        case 0x05:
-            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: bad argument or framing, the app's command error
-            if (arg >= kNumSlots) s_last_result = CMD_RESULT_INVALID;
-            else defer(func, arg, 0);
-            break;
-        case 0x06:
-        case 0x09:
-            defer(func, 0, 0);
-            break;
-        case 0x07:
-        case 0x08:
-            // Give the host time to finish the control transfer (the HID path
-            // runs this before its status stage) before the bus disappears.
-            defer(func, 0, 50);
-            break;
-        case 0x0A:
-            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: bad argument or framing, the app's command error
-            if (arg >= kNumTriggerPresets) s_last_result = CMD_RESULT_INVALID;
-            else defer(func, arg, 0);
-            break;
-        case 0x0E: {
-            // [side, tenths]: no duration byte = 0.5 s (apps before 1.15),
-            // 0 = stop, else clamped to 0.1..5 s.
-            uint8_t tenths = bufsize >= 3 ? buffer[2] : kGripDefaultTenths;
-            if (tenths > kGripMaxTenths) tenths = kGripMaxTenths;
-            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: bad argument or framing, the app's command error
-            if (arg > 2) s_last_result = CMD_RESULT_INVALID;
-            else {
-                defer(func, arg, 0);
-                s_pending_arg2 = tenths;
-            }
-            break;
-        }
-        case 0x17:
-            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: bad argument or framing, the app's command error
-            if (bufsize < 2 || (arg & ~POWER_FLAGS_MASK)) s_last_result = CMD_RESULT_INVALID;
-            else defer(func, arg, 0);
-            break;
-        case 0x18:
-            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: bad argument or framing, the app's command error
-            if (bufsize < 3 || arg > 1 || buffer[2] > 1) s_last_result = CMD_RESULT_INVALID;
-            else defer(func, (uint8_t) (arg | (buffer[2] << 1)), 0);
-            break;
-        case 0x19: {
-            const uint16_t hold = (uint16_t) ((bufsize >= 3 ? buffer[2] : 0) | (bufsize >= 4 ? buffer[3] << 8 : 0));
-            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: bad argument or framing, the app's command error
-            if (bufsize < 2 || arg >= oledvpad::kNumButtons || hold > oledvpad::kMaxHoldMs) s_last_result = CMD_RESULT_INVALID;
-            else {
-                s_pending_hold_ms = hold;
-                defer(func, arg, 0);
-            }
-            break;
-        }
-        case 0x0B:
-            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: bad argument or framing, the app's command error
-            if (arg != 0xFF && (arg < 1 || arg > kVoiceNumLangs)) s_last_result = CMD_RESULT_INVALID;
-            else defer(func, arg, 0);
-            break;
-        case 0x0C:
-            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: bad argument or framing, the app's command error
-            if (bufsize < 3 || arg >= VOICE_NUM_LINES || buffer[2] >= kVoiceNumLangs) s_last_result = CMD_RESULT_INVALID;
-            // error: SHOWN — CMD_RESULT_FAILED in the 0xF1 result byte: no controller connected, the app's command error
-            else if (!bt_is_connected()) s_last_result = CMD_RESULT_FAILED;
-            else voice_say_lang(static_cast<VoiceLine>(arg), buffer[2]);
-            break;
+// Whether a 0x0D / 0x10 / 0x13 / 0x14 SET saves to flash (0x13 / 0x14 with
+// their temporary byte at 1 stay in RAM; a malformed one is deferred too and
+// answers INVALID from cmd_task()).
+static bool table_cmd_writes_flash(uint8_t const *buffer, uint16_t bufsize) {
+    switch (buffer[0]) {
         case 0x0D:
         case 0x10:
-        case 0x11:
+            return true;
         case 0x13:
-        case 0x14:
-            break;
-        case 0x15:
-            perf_reset();
-            break;
-        case 0x16:
-            // Queued, not deferred: it runs in cmd_task() over a few seconds
-            // without making other commands BUSY. Poll GET 0xEB for the answer.
-#if ENABLE_COMPANION_VENDOR
-            s_last_result = ctrl_test_start(buffer + 1, bufsize - 1);
-#else
-            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: controller tests not built in (no vendor interface), the app only offers them when identity [46] bit0 says so
-            s_last_result = CMD_RESULT_INVALID;
-#endif
-            break;
-        case 0x1A: {
-            // [tenths]: the identify screen (proto 1.20). No byte = 3 s,
-            // 0 = stop, else clamped to 0.1..10 s. Not deferred: it only
-            // starts a timer the OLED loop draws from, so nothing waits.
-            uint8_t tenths = bufsize >= 2 ? arg : identify::kDefaultTenths;
-            if (tenths > identify::kMaxTenths) tenths = identify::kMaxTenths;
-            oled_identify(tenths);
-            break;
+            return !(bufsize >= 4 + kRemapExtraCount + 1 && buffer[4 + kRemapExtraCount] == 1);
+        case 0x14: {
+            constexpr uint16_t kNeed = 5 + 2 * sizeof(StickCurve) + 1;
+            return !(bufsize >= kNeed && buffer[kNeed - 1] == 1);
         }
-        case 0x12:
-            remap_revert();
-            curves_revert(); // a game's stick curves end with its layout
-            break;
         default:
-            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: unknown function, the app's command error
-            s_last_result = CMD_RESULT_INVALID;
-            break;
+            // error: NOT-WORTH — a yes/no answer, not a failure: other functions never reach here
+            return false;
     }
+}
+
+// The table / calibration functions (0x0D, 0x10, 0x11, 0x13, 0x14); the
+// result goes to s_last_result. Called from pico_cmd_set() for the RAM-only
+// ones and from cmd_task() for the ones that save.
+static void run_table_cmd(uint8_t const *buffer, uint16_t bufsize) {
+    s_last_result = CMD_RESULT_OK;
     // 0x10 set button-remap table (OLED Edition). Hardened framing so a stray
     // write to 0xF6 can't corrupt the map: magic 'R''M' + protocol version gate
     // before remap_set() (which itself validates each entry <16 or 0xFF=off).
@@ -1115,6 +1037,209 @@ void pico_cmd_set(uint8_t report_id, uint8_t const *buffer, uint16_t bufsize) {
                 // error: SHOWN — CMD_RESULT_FAILED in the 0xF1 result byte: applied but not saved, the app's command error
                 s_last_result = CMD_RESULT_FAILED;
                 break;
+        }
+    }
+}
+
+void pico_cmd_set(uint8_t report_id, uint8_t const *buffer, uint16_t bufsize) {
+    // Only 0xF6 carries commands; the other ids are read-only status reports.
+    if (report_id != PICO_CMD_SET || bufsize == 0) {
+        return;
+    }
+
+    const uint8_t func = buffer[0];
+    const uint8_t arg = bufsize >= 2 ? buffer[1] : 0xFF;
+    s_cmd_seq++;
+
+    s_last_func = func;
+
+    // While a deferred function is waiting to run in cmd_task(), every other
+    // SET is refused with BUSY (a host must wait for 0xF1 to leave PENDING
+    // first); cmd_task() reports the deferred one's result under its own id.
+    if (s_pending) {
+        // error: SHOWN — CMD_RESULT_BUSY in the 0xF1 result byte: a deferred command is still pending; the app waits for 0xF1 first and shows a command error if it ever sees BUSY
+        s_last_result = CMD_RESULT_BUSY;
+        return;
+    }
+    const bool deferred = func == 0x02 || (func >= 0x04 && func <= 0x0B) || func == 0x17 || func == 0x18 || func == 0x19 || func == 0x1B;
+
+    //   0x01 update config in RAM          0x02 write config to flash (deferred)
+    //   0x03 reconnect tinyusb device      0x04 [slot] switch slot (deferred)
+    //   0x05 [slot] forget slot            0x06 wipe all slots
+    //   0x07 reboot                        0x08 reboot into BOOTSEL
+    //   0x09 factory reset + save          0x0A [preset] trigger preset preview
+    //   0x0B [v] narrator: 0xFF off, 1..7 language; saved (deferred)
+    //   0x0C [line][lang] say a narrator line now (app preview)
+    //   0x0D calibration (below)           0x10 remap table (below)
+    //   0x0E [side][tenths] grip test: side 0 left, 1 right, 2 both; held
+    //        steadily for tenths x 0.1 s (no byte: 0.5 s; 0 stops; max 5 s);
+    //        a new one replaces the running one (deferred)
+    //   0x11 remap table for now (below)   0x12 back to the saved remap table
+    //                                         (and the saved stick curves)
+    //   0x13 Edge extra buttons (below)    0x14 stick response curves (below)
+    //   0x15 reset the timing counters (0xFC [11..62], proto 1.11)
+    //   0x16 [dev][action][pages] run a controller test command (proto 1.12,
+    //        ctrl_info.cpp; read the answer with GET 0xEB)
+    //   0x17 [flags] PC sleep options (proto 1.14): bit0 controller off when
+    //        the PC sleeps, bit1 PS button wakes the PC; saved (deferred)
+    //   0x18 [key][press] remote OLED key press (proto 1.18): key 0 KEY0,
+    //        1 KEY1; press 0 short, 1 long; played through handle_buttons()
+    //        like the board's keys, OLED wired or not (deferred; BUSY when
+    //        four presses are already waiting)
+    //   0x19 [button][hold lo][hold hi] virtual controller button for the
+    //        OLED screens (proto 1.19): button 0 up, 1 down, 2 left, 3 right,
+    //        4 triangle, 5 circle, 6 cross, 7 square, 8 R1; hold in ms, 0 or
+    //        absent = a tap, up to 5000. Only the OLED's input handling sees
+    //        it, never the PC's report (deferred; BUSY when four wait)
+    //   0x1A [tenths] identify (proto 1.20): the OLED shows "THIS ONE" with
+    //        the board name and slot, flashing, at full brightness for
+    //        tenths x 0.1 s (no byte: 3 s; 0 stops; max 10 s), and the LED
+    //        blinks in step; then both go back to what they were
+    //   0x1B [display] the display the board drives (proto 1.21,
+    //        display_table.h: 0 none, 1 Waveshare Pico-OLED-1.3); saved
+    //        (deferred), used from the next start; INVALID for a display this
+    //        image has no driver for
+    s_last_result = CMD_RESULT_OK;
+    switch (func) {
+        case 0x01:
+            printf("[CMD] Enter config set func\n");
+        {
+            // The active slot only changes through 0x04 (bt_set_slot): a host
+            // writing a config it read earlier must not move it back.
+            Config_body body = get_config();
+            const uint16_t n = bufsize - 1 < sizeof(body) ? bufsize - 1 : sizeof(body);
+            memcpy(&body, buffer + 1, n);
+            body.current_slot = (uint8_t) bt_get_slot();
+            set_config((const uint8_t *) &body, sizeof(body));
+        }
+            s_host_gen++;
+            break;
+        case 0x02:
+            defer(func, 0, 0);
+            break;
+        case 0x03:
+            printf("[CMD] Enter tud reconnect func\n");
+            usb_power_reconnect();  // a deliberate reconnect, not a PC sleep
+            break;
+        case 0x04:
+        case 0x05:
+            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: bad argument or framing, the app's command error
+            if (arg >= kNumSlots) s_last_result = CMD_RESULT_INVALID;
+            else defer(func, arg, 0);
+            break;
+        case 0x06:
+        case 0x09:
+            defer(func, 0, 0);
+            break;
+        case 0x07:
+        case 0x08:
+            // Give the host time to finish the control transfer (the HID path
+            // runs this before its status stage) before the bus disappears.
+            defer(func, 0, 50);
+            break;
+        case 0x0A:
+            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: bad argument or framing, the app's command error
+            if (arg >= kNumTriggerPresets) s_last_result = CMD_RESULT_INVALID;
+            else defer(func, arg, 0);
+            break;
+        case 0x0E: {
+            // [side, tenths]: no duration byte = 0.5 s (apps before 1.15),
+            // 0 = stop, else clamped to 0.1..5 s.
+            uint8_t tenths = bufsize >= 3 ? buffer[2] : kGripDefaultTenths;
+            if (tenths > kGripMaxTenths) tenths = kGripMaxTenths;
+            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: bad argument or framing, the app's command error
+            if (arg > 2) s_last_result = CMD_RESULT_INVALID;
+            else {
+                defer(func, arg, 0);
+                s_pending_arg2 = tenths;
+            }
+            break;
+        }
+        case 0x17:
+            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: bad argument or framing, the app's command error
+            if (bufsize < 2 || (arg & ~POWER_FLAGS_MASK)) s_last_result = CMD_RESULT_INVALID;
+            else defer(func, arg, 0);
+            break;
+        case 0x1B:
+            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: bad argument or framing, the app's command error
+            if (bufsize < 2 || !display::is_supported(arg)) s_last_result = CMD_RESULT_INVALID;
+            else defer(func, arg, 0);
+            break;
+        case 0x18:
+            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: bad argument or framing, the app's command error
+            if (bufsize < 3 || arg > 1 || buffer[2] > 1) s_last_result = CMD_RESULT_INVALID;
+            else defer(func, (uint8_t) (arg | (buffer[2] << 1)), 0);
+            break;
+        case 0x19: {
+            const uint16_t hold = (uint16_t) ((bufsize >= 3 ? buffer[2] : 0) | (bufsize >= 4 ? buffer[3] << 8 : 0));
+            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: bad argument or framing, the app's command error
+            if (bufsize < 2 || arg >= oledvpad::kNumButtons || hold > oledvpad::kMaxHoldMs) s_last_result = CMD_RESULT_INVALID;
+            else {
+                s_pending_hold_ms = hold;
+                defer(func, arg, 0);
+            }
+            break;
+        }
+        case 0x0B:
+            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: bad argument or framing, the app's command error
+            if (arg != 0xFF && (arg < 1 || arg > kVoiceNumLangs)) s_last_result = CMD_RESULT_INVALID;
+            else defer(func, arg, 0);
+            break;
+        case 0x0C:
+            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: bad argument or framing, the app's command error
+            if (bufsize < 3 || arg >= VOICE_NUM_LINES || buffer[2] >= kVoiceNumLangs) s_last_result = CMD_RESULT_INVALID;
+            // error: SHOWN — CMD_RESULT_FAILED in the 0xF1 result byte: no controller connected, the app's command error
+            else if (!bt_is_connected()) s_last_result = CMD_RESULT_FAILED;
+            else voice_say_lang(static_cast<VoiceLine>(arg), buffer[2]);
+            break;
+        case 0x0D:
+        case 0x10:
+        case 0x11:
+        case 0x13:
+        case 0x14:
+            break;
+        case 0x15:
+            perf_reset();
+            break;
+        case 0x16:
+            // Queued, not deferred: it runs in cmd_task() over a few seconds
+            // without making other commands BUSY. Poll GET 0xEB for the answer.
+#if ENABLE_COMPANION_VENDOR
+            s_last_result = ctrl_test_start(buffer + 1, bufsize - 1);
+#else
+            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: controller tests not built in (no vendor interface), the app only offers them when identity [46] bit0 says so
+            s_last_result = CMD_RESULT_INVALID;
+#endif
+            break;
+        case 0x1A: {
+            // [tenths]: the identify screen (proto 1.20). No byte = 3 s,
+            // 0 = stop, else clamped to 0.1..10 s. Not deferred: it only
+            // starts a timer the OLED loop draws from, so nothing waits.
+            uint8_t tenths = bufsize >= 2 ? arg : identify::kDefaultTenths;
+            if (tenths > identify::kMaxTenths) tenths = identify::kMaxTenths;
+            oled_identify(tenths);
+            break;
+        }
+        case 0x12:
+            remap_revert();
+            curves_revert(); // a game's stick curves end with its layout
+            break;
+        default:
+            // error: SHOWN — CMD_RESULT_INVALID in the 0xF1 result byte: unknown function, the app's command error
+            s_last_result = CMD_RESULT_INVALID;
+            break;
+    }
+    // 0x0D / 0x10 and a saved 0x13 / 0x14 write flash: deferred to cmd_task()
+    // (review S1), so the sector erase never runs inside this USB control
+    // callback. 0x11 and a temporary 0x13 / 0x14 only touch RAM and run now.
+    if (func == 0x0D || func == 0x10 || func == 0x11 || func == 0x13 || func == 0x14) {
+        // error: NOT-WORTH — a yes/no choice of when to run, not a failure; the result comes from run_table_cmd
+        if (table_cmd_writes_flash(buffer, bufsize)) {
+            s_pending_len = bufsize < sizeof(s_pending_buf) ? bufsize : sizeof(s_pending_buf);
+            memcpy(s_pending_buf, buffer, s_pending_len);
+            defer(func, 0, 0);
+        } else {
+            run_table_cmd(buffer, bufsize);
         }
     }
 }

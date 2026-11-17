@@ -22,7 +22,7 @@ struct __attribute__((packed)) Config_body {
     uint8_t inactive_time; // [5,60] min
     uint8_t disable_inactive_disconnect; // bool: 0 disable,1 enable
     uint8_t disable_pico_led; // bool
-    uint8_t polling_rate_mode; // 0: 250Hz, 1: 500Hz, 2: real-time
+    uint8_t polling_rate_mode; // 0: 250Hz, 1: 500Hz, 2: real-time, 3: 1000Hz (protocol 1.22; upstream d54cb89 renumbered 2 = 1000Hz, 3 = real-time, ours keeps 2 so saved settings stay valid)
     uint8_t audio_buffer_length; // [32,128] (kAudioBufferMin); 16..31 saved by older firmware read as 32
     uint8_t controller_mode; // 0: DS5, 1: DSE, 2: Auto
     uint8_t current_slot;    // [0..3] active multi-pairing slot (OLED Edition Phase G)
@@ -111,6 +111,16 @@ struct __attribute__((packed)) Config_body {
     // AudioControl (a game's, the PC driver's, the connect-time state) and
     // pushed at once on a change. 0xFF from older firmware takes the default.
     uint8_t mic_echo_cancel;
+    // Protocol 1.22 (upstream's 2026-10-17/18 batch, ported): appended like
+    // the 1.13 fields, so 0xFF from older firmware takes the default.
+    // The speaker / haptics audio report: 0 = the packed 0x39 (two haptic +
+    // two speaker frames per report, default), 1 = 0.7.2's 0x36 (one of each,
+    // twice the report rate; upstream 95dcdbb).
+    uint8_t packet_mode;
+    // 1 = drop the controller's Bluetooth link when it is put on a dock or
+    // charging station (input report byte 53 bit 6, DockDetect); 0 = off
+    // (default). Upstream 2e79733 + 3fa663e.
+    uint8_t disconnect_on_dock;
 };
 
 // The body as protocol 1.6 to 1.12 sent it. A config GET (0xF7) for the
@@ -121,7 +131,9 @@ constexpr unsigned kConfigBodyV16 = 42;
 static_assert(__builtin_offsetof(Config_body, trigger_reduce) == kConfigBodyV16, "protocol 1.13 fields start after the 1.6 body");
 static_assert(__builtin_offsetof(Config_body, mic_level) == 49, "protocol 1.16's mic level follows the 49-byte 1.13 body");
 static_assert(__builtin_offsetof(Config_body, mic_echo_cancel) == 50, "protocol 1.17's echo cancellation follows the 50-byte 1.16 body");
-static_assert(sizeof(Config_body) == 51, "update cmd.cpp, the app's config.ts and CLAUDE.md with the body");
+static_assert(__builtin_offsetof(Config_body, packet_mode) == 51, "protocol 1.22's fields follow the 51-byte 1.17 body");
+static_assert(__builtin_offsetof(Config_body, disconnect_on_dock) == 52, "protocol 1.22's dock disconnect follows the audio report choice");
+static_assert(sizeof(Config_body) == 53, "update cmd.cpp, the app's config.ts and CLAUDE.md with the body");
 
 // What the dongle does when the PC sleeps (protocol 1.14, src/usb_power.h).
 // Kept after the body, not in it: set and saved on its own (0xF6 0x17, like
@@ -143,6 +155,13 @@ struct __attribute__((packed)) Config {
     // POWER_* bits. Not in the CRC (older firmware wrote 0xFF here, which reads
     // as the default, as does anything outside POWER_FLAGS_MASK).
     uint8_t power_flags;
+    // The display the OLED code drives (protocol 1.21, src/display_table.h:
+    // 0 none, 1 Waveshare Pico-OLED-1.3). Kept here like power_flags, not in
+    // the body, so the body (the app's config layout) doesn't change: set and
+    // saved on its own (0xF6 0x1B), read in 0xEA [11..13], used from the next
+    // start. Not in the CRC; 0xFF from older firmware reads as the
+    // Pico-OLED-1.3, which every earlier image drove.
+    uint8_t display_id;
 };
 
 void config_default();
@@ -155,12 +174,20 @@ bool config_unsaved();  // RAM settings differ from flash
 // Set the narrator byte in RAM and in flash, leaving every other saved
 // setting as it is in flash (unsaved edits stay unsaved).
 bool config_save_narrator(uint8_t value);
+// Set the current slot in RAM and in flash, like config_save_narrator (other
+// unsaved edits stay unsaved). False = the flash write failed.
+bool config_save_current_slot(uint8_t slot);
 uint8_t config_power_flags();
 // Set the POWER_* bits in RAM and in flash, like config_save_narrator (other
 // unsaved edits stay unsaved). False = invalid bits or the flash write failed.
 bool config_save_power_flags(uint8_t flags);
 // RAM only (the OLED Settings screen; its Triangle save writes them).
 void config_set_power_flags(uint8_t flags);
+// The saved display choice (display_table.h ids), resolved: never 0xFF.
+uint8_t config_display_id();
+// Save a display choice on its own, like config_save_power_flags. False = not
+// a display this image drives, or the flash write failed.
+bool config_save_display_id(uint8_t id);
 const Config_body& get_config();
 void set_config(const uint8_t *new_config, const uint16_t len);
 void config_valid();

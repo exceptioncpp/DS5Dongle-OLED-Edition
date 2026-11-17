@@ -4,6 +4,7 @@
 // on load must never reset settings a released firmware saved.
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -14,6 +15,7 @@
 #include "flash_layout.h"
 #include "hardware/flash.h"
 #include "test.h"
+#include "fixtures/config/gen/nondefault.h"
 
 namespace fs = std::filesystem;
 
@@ -156,4 +158,99 @@ TEST(config_fixtures_upstream_07_pages_load_defaults_as_before) {
         CHECK(!region_erased(LEGACY_CONFIG_FLASH_OFFSET));  // not ours: left alone
     }
     CHECK(seen >= 6);
+}
+
+// Review fw-usb-bt N4: a one-field save (narrator, PC sleep options) on a
+// page from any released writer keeps every other setting as config_load()
+// read it. It used to copy the page raw: a 0.9.5-dev.9 page's power flags
+// (body[49]) became mic_level, and a page failing its CRC was re-blessed.
+// Afterwards nothing shows as unsaved.
+TEST(config_fixtures_one_field_saves_keep_the_other_settings) {
+    const auto fixtures = load_fixtures();
+    int seen = 0;
+    // loop: NOT-WORTH — host test
+    for (const Fixture &x : fixtures) {
+        if (is_upstream_07(x.tag)) continue;
+        // loop: NOT-WORTH — host test, the two one-field saves
+        for (int which = 0; which < 2; which++) {
+            fake_flash_erase_all();
+            g_fake_flash_fail = false;
+            std::memcpy(g_fake_flash + PICO_FLASH_SIZE_BYTES - x.from_end, x.page.data(), FLASH_PAGE_SIZE);
+            config_default();
+            config_load();
+            Config_body before = get_config();
+            const uint8_t flags_before = config_power_flags();
+            if (which == 0) {
+                CHECK(config_save_narrator(5));
+                before.narrator_voice = 5;
+            } else {
+                CHECK(config_save_power_flags(0x02));
+            }
+            config_default();
+            config_load();
+            const Config_body after = get_config();
+            const bool same = std::memcmp(&before, &after, sizeof(before)) == 0;
+            if (!same) std::fprintf(stderr, "  %s/%s: save %d changed other settings\n", x.tag.c_str(), x.scenario.c_str(), which);
+            CHECK(same);
+            CHECK_EQ(config_power_flags(), which == 0 ? flags_before : 0x02);
+            // Re-review P-N1: the saved copy is what load reads, so nothing
+            // shows as unsaved (a short body's 0xFF fields were saved raw).
+            if (config_unsaved()) std::fprintf(stderr, "  %s/%s: save %d left unsaved changes\n", x.tag.c_str(), x.scenario.c_str(), which);
+            CHECK(!config_unsaved());
+            seen++;
+        }
+    }
+    CHECK(seen > 0);
+}
+
+// A page failing its CRC loads defaults; a one-field save then starts from
+// those (RAM), not from the bad page's bytes.
+TEST(config_one_field_save_never_reblesses_a_bad_page) {
+    fake_flash_erase_all();
+    g_fake_flash_fail = false;
+    config_default();
+    Config_body b = get_config();
+    b.inactive_time = 42;
+    set_config(b);
+    CHECK(config_save());
+    g_fake_flash[CONFIG_FLASH_OFFSET + offsetof(Config, body) + offsetof(Config_body, inactive_time)] ^= 0x01;  // torn
+    config_load();
+    CHECK_EQ(get_config().inactive_time, 30);  // defaults
+    CHECK(config_save_narrator(2));
+    config_load();
+    CHECK_EQ(get_config().inactive_time, 30);
+    CHECK_EQ(get_config().narrator_voice, 2);
+}
+
+// Review update-flash N7: going back to the last stable release keeps the
+// settings. gen/stable_reads.sh runs that release's own config.cpp on the
+// page this firmware saves with the custom settings (stable/current_custom.bin)
+// and records the result in stable/RESULT.txt. This test holds the recorded
+// page to what this firmware saves now: when the saved page changes, rerun
+// the host tests with DS5_STABLE_PAGE_OUT=<that file> and then the script.
+TEST(config_stable_release_reads_the_current_page) {
+    fake_flash_erase_all();
+    g_fake_flash_fail = false;
+    config_load();
+    Config_body b = get_config();
+    nondefault(b);
+    set_config(b);
+    CHECK(config_save());
+    const uint32_t from_end = PICO_FLASH_SIZE_BYTES - CONFIG_FLASH_OFFSET;
+    std::vector<uint8_t> now(4 + FLASH_PAGE_SIZE);
+    std::memcpy(now.data(), &from_end, 4);
+    std::memcpy(now.data() + 4, g_fake_flash + CONFIG_FLASH_OFFSET, FLASH_PAGE_SIZE);
+    if (const char *out = std::getenv("DS5_STABLE_PAGE_OUT")) {
+        std::ofstream(out, std::ios::binary).write(reinterpret_cast<const char *>(now.data()), (std::streamsize) now.size());
+    }
+    const std::string dir = std::string(CONFIG_FIXTURES) + "/stable/";
+    std::ifstream in(dir + "current_custom.bin", std::ios::binary);
+    const std::vector<uint8_t> recorded((std::istreambuf_iterator<char>(in)), {});
+    const bool same = recorded == now;
+    if (!same) std::fprintf(stderr, "  the saved page changed: rerun gen/stable_reads.sh (see this test)\n");
+    CHECK(same);
+    std::ifstream res(dir + "RESULT.txt");
+    std::string verdict;
+    res >> verdict;
+    CHECK(verdict == "ok");
 }

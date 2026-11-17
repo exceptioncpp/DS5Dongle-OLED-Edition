@@ -38,6 +38,10 @@ uint32_t audio_mic_plc_frames();   // count of packet-loss-concealment frames ge
 uint32_t audio_mic_level_drops();  // frames the jitter buffer's level control dropped (src/mic_level.h)
 uint8_t audio_mic_level();         // jitter-buffer frames queued at the last frame boundary
 uint8_t audio_mic_level_max();     // ...the highest this mic session
+uint32_t audio_mic_in_drops();     // mic Opus packets dropped: mic_fifo full (core1 behind)
+uint32_t audio_mic_buf_drops();    // decoded mic frames dropped: jitter buffer full
+uint32_t audio_mic_underruns();    // 1 ms silent slices while playing: jitter buffer empty
+uint32_t audio_usb_out_overruns(); // times audio_loop found the PC's speaker FIFO full or overrun
 
 // Called from on_bt_data() in main.cpp when the DS5 sends a mic-tagged
 // 0x31 input report. Buffer must point at MIC_OPUS_SIZE (71) bytes of
@@ -46,6 +50,7 @@ void mic_add_queue(const uint8_t *data);
 
 // Host opened/closed the mic IN interface (tud_audio_set_itf_cb / unmount).
 void audio_set_mic_active(bool active);
+void audio_speaker_stream_opened();  // the PC opened the speaker stream: drop the last one's leftovers
 // True while the host is recording AND BT Mic is enabled — gates the DS5
 // mic-enable bit and the mic decode path.
 bool audio_mic_wanted();

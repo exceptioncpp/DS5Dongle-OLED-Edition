@@ -32,6 +32,8 @@ add_executable(host_tests
         test_oled_vpad.cpp
         test_state_override.cpp
         test_audio_levels.cpp
+        test_auto_haptics.cpp
+        test_speaker_resample.cpp
         test_speaker_mono.cpp
         test_rssi_poll.cpp
         test_signal_screen.cpp
@@ -39,6 +41,7 @@ add_executable(host_tests
         test_voice_cue.cpp
         test_slots.cpp
         test_scan_policy.cpp
+        test_bt_policy.cpp
         test_ctrl_send.cpp
         test_mic_level.cpp
         test_pair_prompt.cpp
@@ -50,6 +53,7 @@ add_executable(host_tests
         test_mic_session.cpp
         test_config_fixtures.cpp
         test_heap.cpp
+        test_fw_identity.cpp
         # The firmware sources under test, unmodified.
         ${FW}/src/calib.cpp
         ${FW}/src/remap.cpp
@@ -59,20 +63,18 @@ add_executable(host_tests
         ${FW}/src/ctrl_info.cpp
         ${FW}/src/dse.cpp
         ${FW}/src/slots.cpp
-        # The reference the haptics decimator is checked against (lib/WDL submodule).
-        ${FW}/lib/WDL/WDL/resample.cpp
 )
 # stubs/ first so its SDK headers win.
-target_include_directories(host_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/stubs ${FW}/src ${FW}/lib/WDL/WDL)
+target_include_directories(host_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/stubs ${FW}/src)
 target_compile_definitions(host_tests PRIVATE
         ENABLE_COMPANION_VENDOR=1
         ENABLE_SERIAL=0
         ENABLE_VERBOSE=0
         DS5_BOARD_NAME="Host"
+        DS5_BOARD_TYPE_ID=1
         SYS_CLOCK_KHZ=150000
         FIRMWARE_VERSION="host-test"
         PICO_PROGRAM_VERSION_STRING="host-test"
-        WDL_RESAMPLE_TYPE=float  # as the firmware build
         CONFIG_FIXTURES="${CMAKE_CURRENT_SOURCE_DIR}/fixtures/config"  # test_config_fixtures.cpp
 )
 # Same char signedness as the firmware build (CMakeLists.txt: -fsigned-char).
@@ -80,5 +82,4 @@ target_compile_options(host_tests PRIVATE -O1 -g -fsigned-char -Wall -Wextra -Wn
 target_link_options(host_tests PRIVATE ${SAN})
 find_package(Threads REQUIRED)  # test_perf.cpp: a writer thread stands in for core1
 target_link_libraries(host_tests PRIVATE Threads::Threads)
-# Third-party: no warnings from WDL itself.
-set_source_files_properties(${FW}/lib/WDL/WDL/resample.cpp PROPERTIES COMPILE_OPTIONS "-w")
+

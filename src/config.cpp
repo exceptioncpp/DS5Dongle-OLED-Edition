@@ -14,6 +14,7 @@
 #include "hardware/flash.h"
 #include "flash_safe.h"
 #include "flash_layout.h"
+#include "display_table.h"
 #include "pico/btstack_flash_bank.h"
 #include "hardware/sync.h"
 #include "pico/cyw43_arch.h"
@@ -41,22 +42,25 @@ const Config *flash_config() {
     return reinterpret_cast<const Config *>(XIP_BASE + CONFIG_FLASH_OFFSET);
 }
 
-void config_valid() {
+// Every field of `c` in range, as load reads a page: an out-of-range value
+// (0xFF from erased flash or a shorter body from older firmware) takes its
+// default.
+static void config_normalise(Config &c) {
     // valid config and set default value
     // error: LOGGED-OK — printf; a blank or old sector gets defaults; RAM then differs from flash, which the app shows as unsaved settings (identity [19] bit0)
-    if (config.magic != CONFIG_MAGIC) {
-        config.magic = CONFIG_MAGIC;
+    if (c.magic != CONFIG_MAGIC) {
+        c.magic = CONFIG_MAGIC;
         printf("[Config] Config Magic Header is invalid\n");
     }
-    if (config.version != CONFIG_VERSION) {
-        config.version = CONFIG_VERSION;
+    if (c.version != CONFIG_VERSION) {
+        c.version = CONFIG_VERSION;
         printf("[Config] Config Version is invalid\n");
     }
-    if (config.size != sizeof(Config_body)) {
-        config.size = sizeof(Config_body);
+    if (c.size != sizeof(Config_body)) {
+        c.size = sizeof(Config_body);
         printf("[Config] Config Body size is invalid\n");
     }
-    auto body = &config.body;
+    auto body = &c.body;
     if (std::isnan(body->haptics_gain) || body->haptics_gain < 1.0f || body->haptics_gain > 6.0f) {
         body->haptics_gain = 1.0f;
         printf("[Config] Haptics Gain value is invalid\n");
@@ -80,7 +84,7 @@ void config_valid() {
         body->disable_pico_led = 0;
         printf("[Config] disable_pico_led is invalid\n");
     }
-    if (body->polling_rate_mode > 2) {
+    if (body->polling_rate_mode > 3) {  // 3 = 1000 Hz (protocol 1.22)
         // Fresh / erased config: 500 Hz (upstream 501d435). A saved rate is
         // valid and never reaches this line, so nobody's choice changes.
         body->polling_rate_mode = 1;
@@ -152,12 +156,17 @@ void config_valid() {
     if (body->status_gpio_mode > 1) body->status_gpio_mode = 0;
     if (body->mic_level > kMicLevelMax) body->mic_level = 0;    // protocol 1.16: follow the PC
     if (body->mic_echo_cancel > 1) body->mic_echo_cancel = 1;   // protocol 1.17: on
-    if (config.power_flags & ~POWER_FLAGS_MASK) config.power_flags = POWER_FLAGS_DEFAULT; // 0xFF erased / older firmware
+    if (body->packet_mode > 1) body->packet_mode = 0;           // protocol 1.22: the packed 0x39
+    if (body->disconnect_on_dock > 1) body->disconnect_on_dock = 0;  // protocol 1.22: off
+    if (c.power_flags & ~POWER_FLAGS_MASK) c.power_flags = POWER_FLAGS_DEFAULT; // 0xFF erased / older firmware
+    c.display_id = display::resolve(c.display_id);  // 0xFF from firmware before 1.21: the Pico-OLED-1.3
     if (body->config_version != CONFIG_VERSION) {
         body->config_version = CONFIG_VERSION;
         printf("[Config] Warning: Config may breaking change\n");
     }
 }
+
+void config_valid() { config_normalise(config); }
 
 // True when the settings in RAM differ from the ones saved in flash (or
 // nothing valid is saved yet). Core 0 only, like every flash write, so the
@@ -165,8 +174,9 @@ void config_valid() {
 bool config_unsaved() {
     const Config *saved = flash_config();
     // error: NOT-WORTH — nothing; reads which copy to start from (no valid save yet = the RAM copy), not a failure
+    // display_id as it resolves: a page from older firmware (0xFF) isn't an unsaved change.
     return saved->magic != CONFIG_MAGIC || memcmp(&saved->body, &config.body, sizeof(Config_body)) != 0 ||
-           saved->power_flags != config.power_flags;
+           saved->power_flags != config.power_flags || display::resolve(saved->display_id) != config.display_id;
 }
 
 // A saved page is intact when its magic is ours and its CRC matches the body
@@ -209,11 +219,36 @@ static void invalidate_legacy_config() {
 // mic_level (and lost the PC sleep options); before 1.14 that byte was 0xFF.
 // So that byte is the power flags, and the body after `size` reads as erased
 // flash (each newer field at its default).
-static void config_take_short_body(const Config *page) {
-    if (config.size >= sizeof(Config_body)) return;
+static void take_short_body(Config &dst, const Config *page) {
+    // error: NOT-WORTH — not a failure: a full-length body has nothing to fill in
+    if (dst.size >= sizeof(Config_body)) return;
     const auto *saved_body = reinterpret_cast<const uint8_t *>(page) + offsetof(Config, body);
-    config.power_flags = saved_body[config.size];
-    memset(reinterpret_cast<uint8_t *>(&config.body) + config.size, 0xFF, sizeof(Config_body) - config.size);
+    dst.power_flags = saved_body[dst.size];
+    // The display choice follows the power flags (0xFF on every page saved
+    // before 1.21, which takes the default).
+    dst.display_id = saved_body[dst.size + 1];
+    memset(reinterpret_cast<uint8_t *>(&dst.body) + dst.size, 0xFF, sizeof(Config_body) - dst.size);
+}
+
+static void config_take_short_body(const Config *page) { take_short_body(config, page); }
+
+// The saved settings as config_load() reads them, for a save that changes one
+// field only (narrator, power flags, display): an intact page, its shorter
+// body from older firmware read as take_short_body() does and normalised as
+// config_valid() does; else (nothing
+// valid saved, or a page failing its CRC) the RAM copy. Copying any page with
+// our magic took an older page's power flags as mic_level and re-blessed a
+// page that failed its CRC (review fw-usb-bt N4).
+static Config saved_page_or_ram() {
+    const Config *saved = flash_config();
+    // error: NOT-WORTH — nothing; reads which copy to start from (no valid save yet = the RAM copy), not a failure
+    if (!config_page_intact(saved)) return config;
+    Config page = *saved;
+    take_short_body(page, saved);
+    // Each field as load reads it: a short body's 0xFF fields at their
+    // defaults, so the saved copy then matches RAM (config_unsaved).
+    config_normalise(page);
+    return page;
 }
 
 void config_load() {
@@ -245,6 +280,7 @@ void config_load() {
         // default (as erased flash), not whatever in-range bytes it holds.
         memset(&config.body, 0xFF, sizeof(config.body));
         config.power_flags = 0xFF;
+        config.display_id = 0xFF;
     } else {
         config_take_short_body(flash_config());
         // A migration that lost power after the new copy was saved: finish it.
@@ -254,7 +290,8 @@ void config_load() {
     config_valid();
 }
 
-// Reset RAM-resident config body to firmware defaults. Caller must
+// Reset RAM-resident config body to firmware defaults (the display choice
+// stays: it says what hardware is fitted, not a preference). Caller must
 // config_save() to persist. Filling with 0xFF mirrors the byte pattern
 // of a freshly-erased flash sector, so every field fails validity and
 // gets re-initialized to its documented default by config_valid().
@@ -303,13 +340,25 @@ bool config_save_narrator(uint8_t value) {
     config.body.narrator_voice = value;
     config_valid();
     // Flash's copy with only this byte changed; nothing valid saved yet = RAM.
-    const Config *saved = flash_config();
-    // error: NOT-WORTH — nothing; reads which copy to start from (no valid save yet = the RAM copy), not a failure
-    Config page = saved->magic == CONFIG_MAGIC ? *saved : config;
+    Config page = saved_page_or_ram();
     page.magic = CONFIG_MAGIC;
     page.version = CONFIG_VERSION;
     page.size = sizeof(Config_body);  // an older, shorter body grows here
     page.body.narrator_voice = config.body.narrator_voice;
+    if (page.power_flags & ~POWER_FLAGS_MASK) page.power_flags = POWER_FLAGS_DEFAULT;
+    // error: SHOWN — passed up; the callers report it (0xF1 CMD_RESULT_FAILED to the app, the OLED's "Save FAIL")
+    return write_config(page);
+}
+
+bool config_save_current_slot(uint8_t slot) {
+    config.body.current_slot = slot;
+    config_valid();
+    // Flash's copy with only this byte changed; nothing valid saved yet = RAM.
+    Config page = saved_page_or_ram();
+    page.magic = CONFIG_MAGIC;
+    page.version = CONFIG_VERSION;
+    page.size = sizeof(Config_body);
+    page.body.current_slot = config.body.current_slot;
     if (page.power_flags & ~POWER_FLAGS_MASK) page.power_flags = POWER_FLAGS_DEFAULT;
     // error: SHOWN — passed up; the callers report it (0xF1 CMD_RESULT_FAILED to the app, the OLED's "Save FAIL")
     return write_config(page);
@@ -327,13 +376,28 @@ bool config_save_power_flags(uint8_t flags) {
     if (flags & ~POWER_FLAGS_MASK) return false;
     config.power_flags = flags;
     // Flash's copy with only these bits changed; nothing valid saved yet = RAM.
-    const Config *saved = flash_config();
-    // error: NOT-WORTH — nothing; reads which copy to start from (no valid save yet = the RAM copy), not a failure
-    Config page = saved->magic == CONFIG_MAGIC ? *saved : config;
+    Config page = saved_page_or_ram();
     page.magic = CONFIG_MAGIC;
     page.version = CONFIG_VERSION;
     page.size = sizeof(Config_body);
     page.power_flags = flags;
+    // error: SHOWN — passed up; the callers report it (0xF1 CMD_RESULT_FAILED to the app, the OLED's "Save FAIL")
+    return write_config(page);
+}
+
+uint8_t config_display_id() { return config.display_id; }
+
+bool config_save_display_id(uint8_t id) {
+    // error: SHOWN — CMD_RESULT_FAILED in 0xF1 (0x1B also checks the id first and answers INVALID)
+    if (!display::is_supported(id)) return false;
+    config.display_id = id;
+    // Flash's copy with only this byte changed; nothing valid saved yet = RAM.
+    Config page = saved_page_or_ram();
+    page.magic = CONFIG_MAGIC;
+    page.version = CONFIG_VERSION;
+    page.size = sizeof(Config_body);
+    if (page.power_flags & ~POWER_FLAGS_MASK) page.power_flags = POWER_FLAGS_DEFAULT;
+    page.display_id = id;
     // error: SHOWN — passed up; the callers report it (0xF1 CMD_RESULT_FAILED to the app, the OLED's "Save FAIL")
     return write_config(page);
 }

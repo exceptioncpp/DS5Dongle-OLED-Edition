@@ -191,7 +191,7 @@ Linux でゲームに **ボード経由でコントローラーのアダプテ�
 
 | 品目 | 備考 | 参考価格 |
 |---|---|---|
-| **Raspberry Pi Pico 2 W** | RP2350 MCU、オンボードの CYW43 Bluetooth/WiFi。[公式製品ページ](https://www.raspberrypi.com/products/raspberry-pi-pico-2/) | 約 $7 USD |
+| **Raspberry Pi Pico 2 WH**（推奨）または **Pico 2 W** | RP2350 MCU、オンボードの CYW43 Bluetooth/WiFi。**WH** はヘッダーがはんだ付け済みなので、下の OLED をそのまま差し込めます。通常の **W** は先にヘッダーのはんだ付けが必要です。[公式製品ページ](https://www.raspberrypi.com/products/raspberry-pi-pico-2/) | 約 $8 USD（WH）、約 $7 USD（W） |
 | **Sony DualSense コントローラー** | 任意の PS5 DualSense（VID `054C:0CE6`）または DualSense Edge（`054C:0DF2`）。 | — |
 | **USB-C ケーブル** | Pico 2 W をホスト PC に接続します。 | — |
 
@@ -208,7 +208,7 @@ Pico 2 W と Waveshare Pico-OLED-1.3 はどちらも世界中で広く入手で�
 
 - **Adafruit**、**Pimoroni**、**The Pi Hut**、**DigiKey**、**Mouser** — 主要な電子部品販売店（米国／EU）
 - OLED アドオンは **Waveshare の公式ストア**
-- 各地域の **Amazon** — `Raspberry Pi Pico 2 W` と `Waveshare Pico-OLED-1.3`（または SKU `HIPI1798`）で検索
+- 各地域の **Amazon** — `Raspberry Pi Pico 2 WH` と `Waveshare Pico-OLED-1.3`（または SKU `HIPI1798`）で検索
 - **AliExpress** — Waveshare と Pico の正規品とクローン品。出品者の評価を確認してください
 
 ## はじめに
@@ -333,17 +333,17 @@ Pico デバイスは、コントローラーが接続された後にのみシス
 
 ソースからプロジェクトをビルドするには：
 
-1. Pico SDK **2.3.0** をインストールします。ビルドは `pico_sdk_import.cmake` を使います。CI とリリースは ARM 公式の GNU ツールチェーン **15.2.Rel1**（`arm-none-eabi`）でビルドしています。ディストリビューションの `gcc-arm-none-eabi` でも通常は動作しますが、15.2.Rel1 ならリリースと同じバイナリになります。正確な固定バージョン（SDK、TinyUSB のコミット、ツールチェーンのダウンロード先）は `tools/toolchain.env` にあります。ツールチェーンが `PATH` にない場合は、`PICO_TOOLCHAIN_PATH` を展開したツールチェーンのフォルダーに設定してください。
-2. Pico SDK 内（`$PICO_SDK_PATH/lib/tinyusb`）で **TinyUSB を `tools/toolchain.env` のコミットに固定します**：アップストリームと同じく、TinyUSB 0.21 にその後の修正を加えたものです。Pico SDK 2.3.0 はまだ 0.18.0 を同梱しており、このプロジェクトの `tusb_config.h` が使う `TUD_AUDIO_EP_SIZE` の 4 引数形式がありません。また、ビルドは 0.21 以外の TinyUSB を拒否します：
+1. Pico SDK **2.3.1** をインストールします。ビルドは `pico_sdk_import.cmake` を使います。CI とリリースは ARM 公式の GNU ツールチェーン **15.2.Rel1**（`arm-none-eabi`）でビルドしています。ディストリビューションの `gcc-arm-none-eabi` でも通常は動作しますが、15.2.Rel1 ならリリースと同じバイナリになります。正確な固定バージョン（SDK、TinyUSB のコミット、ツールチェーンのダウンロード先）は `tools/toolchain.env` にあります。ツールチェーンが `PATH` にない場合は、`PICO_TOOLCHAIN_PATH` を展開したツールチェーンのフォルダーに設定してください。
+2. Pico SDK 内（`$PICO_SDK_PATH/lib/tinyusb`）で **TinyUSB を `tools/toolchain.env` のコミットに固定します**：アップストリームと同じく、TinyUSB 0.21 にその後の修正を加えたものです。Pico SDK 2.3.1 はまだ 0.18.0 を同梱しており、このプロジェクトの `tusb_config.h` が使う `TUD_AUDIO_EP_SIZE` の 4 引数形式がありません。また、ビルドは 0.21 以外の TinyUSB を拒否します：
    ```bash
    cd "$PICO_SDK_PATH/lib/tinyusb"
-   git fetch --depth 1 origin 2d56dc533e45e4e91b15e93fdab5e22e964f328d
+   git fetch --depth 1 origin 98741b55959564746998d0453c32d87064629d7c
    git checkout --detach FETCH_HEAD
    ```
 3. CMake + Ninja（または Make）で設定してビルドします：
    ```bash
    cd /path/to/DS5Dongle
-   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_PATH="$PICO_SDK_PATH"
+   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_PATH="$PICO_SDK_PATH" -DENABLE_COMPANION_VENDOR=ON
    cmake --build build --target ds5-bridge
    ```
 4. UF2 は `build/ds5-bridge-oled.uf2` に出力されます。いつもどおり BOOTSEL で書き込みます。
@@ -353,6 +353,19 @@ Pico デバイスは、コントローラーが接続された後にのみシス
 - `-DENABLE_BATT_LED=ON`（デフォルト）— DS5 のバッテリー残量が少ないとき Pico の LED を点滅させます。
 - `-DENABLE_SERIAL=ON` — デバッグ用に printf を USB CDC に出力します（デフォルト OFF。製品ビルドでは UART を解放します）。
 - `-DPICO_W_BUILD=ON` — 初代 Pico W 向けにビルドします（オーディオなし、クロックを下げます）。デフォルトは Pico 2 W 向けです。
+
+### Waveshare RP2350B-Plus-W
+
+[Waveshare RP2350B-Plus-W](https://www.waveshare.com/wiki/RP2350B-Plus-W) は、RP2350B、RM2 無線モジュール（Pico 2 W と同じ CYW43 チップ）、16 MiB QSPI フラッシュ、USB-C を搭載しています。`-DWAVESHARE_RP2350B_PLUS_W_BUILD=ON` でこの基板の設定を有効にします。このオプションはデフォルトで OFF のため、通常のビルド対象は引き続き Pico 2 W です。新しいビルドディレクトリと、上記で指定されたバージョンのツールチェーンを使ってください：
+
+```bash
+cmake -S . -B build/waveshare -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DPICO_SDK_PATH="$PICO_SDK_PATH" -DWAVESHARE_RP2350B_PLUS_W_BUILD=ON \
+      -DENABLE_COMPANION_VENDOR=ON
+cmake --build build/waveshare --target ds5-bridge
+```
+
+出力は `build/waveshare/ds5-bridge-oled.uf2` です。`ENABLE_COMPANION_VENDOR=ON` はデスクトップ設定アプリ用のインターフェースを有効にします。Waveshare オプションと `PICO_W_BUILD=ON` は同時に指定できません。OLED の配線と Waveshare ファームウェアの手動更新については[基板ガイド](boards/README.md)を参照してください。
 
 ## 診断とデバッグツール
 

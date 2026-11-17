@@ -191,7 +191,7 @@ Los gatillos nativos funcionan igual en Heroic, pero los lanzadores que no son S
 
 | Artículo | Notas | Precio aprox. |
 |---|---|---|
-| **Raspberry Pi Pico 2 W** | MCU RP2350 con Bluetooth/WiFi CYW43 integrado. [Página oficial del producto](https://www.raspberrypi.com/products/raspberry-pi-pico-2/) | ~7 USD |
+| **Raspberry Pi Pico 2 WH** (recomendada) o **Pico 2 W** | MCU RP2350 con Bluetooth/WiFi CYW43 integrado. La **WH** viene con los pines ya soldados, así que la pantalla OLED de abajo se conecta directamente; a la **W** sencilla hay que soldarle los pines primero. [Página oficial del producto](https://www.raspberrypi.com/products/raspberry-pi-pico-2/) | ~8 USD (WH), ~7 USD (W) |
 | **Mando Sony DualSense** | Cualquier DualSense de PS5 (VID `054C:0CE6`) o DualSense Edge (`054C:0DF2`). | — |
 | **Cable USB-C** | Conecta la Pico 2 W al PC. | — |
 
@@ -208,7 +208,7 @@ Tanto la Pico 2 W como la Waveshare Pico-OLED-1.3 se encuentran fácilmente en t
 
 - **Adafruit**, **Pimoroni**, **The Pi Hut**, **DigiKey**, **Mouser**: grandes distribuidores de electrónica (EE. UU. / UE)
 - **La tienda de Waveshare** para el módulo OLED
-- Las tiendas regionales de **Amazon**: busca `Raspberry Pi Pico 2 W` y `Waveshare Pico-OLED-1.3` (o el SKU `HIPI1798`)
+- Las tiendas regionales de **Amazon**: busca `Raspberry Pi Pico 2 WH` y `Waveshare Pico-OLED-1.3` (o el SKU `HIPI1798`)
 - **AliExpress**: stock original de Waveshare y Pico además de clones; revisa la valoración del vendedor
 
 ## Cómo empezar
@@ -333,17 +333,17 @@ Durante una versión, una compilación desde el código fuente aún puede usar e
 
 Para compilar el proyecto desde el código fuente:
 
-1. Instala el Pico SDK **2.3.0**. La compilación usa `pico_sdk_import.cmake`. CI y las versiones publicadas compilan con la cadena de herramientas GNU oficial de ARM **15.2.Rel1** (`arm-none-eabi`); el `gcc-arm-none-eabi` de una distribución suele funcionar, pero 15.2.Rel1 da el mismo binario que la versión publicada. Las versiones exactas (SDK, commit de TinyUSB, descarga de la cadena de herramientas) están en `tools/toolchain.env`. Pon `PICO_TOOLCHAIN_PATH` en la carpeta descomprimida de la cadena de herramientas si no está en tu `PATH`.
-2. **Fija TinyUSB en el commit de `tools/toolchain.env`** dentro del Pico SDK (`$PICO_SDK_PATH/lib/tinyusb`): TinyUSB 0.21 más correcciones posteriores, como usa upstream. El Pico SDK 2.3.0 sigue incluyendo la 0.18.0, que no tiene la forma de 4 argumentos de `TUD_AUDIO_EP_SIZE` que usa el `tusb_config.h` de este proyecto, y la compilación rechaza cualquier TinyUSB que no sea la 0.21:
+1. Instala el Pico SDK **2.3.1**. La compilación usa `pico_sdk_import.cmake`. CI y las versiones publicadas compilan con la cadena de herramientas GNU oficial de ARM **15.2.Rel1** (`arm-none-eabi`); el `gcc-arm-none-eabi` de una distribución suele funcionar, pero 15.2.Rel1 da el mismo binario que la versión publicada. Las versiones exactas (SDK, commit de TinyUSB, descarga de la cadena de herramientas) están en `tools/toolchain.env`. Pon `PICO_TOOLCHAIN_PATH` en la carpeta descomprimida de la cadena de herramientas si no está en tu `PATH`.
+2. **Fija TinyUSB en el commit de `tools/toolchain.env`** dentro del Pico SDK (`$PICO_SDK_PATH/lib/tinyusb`): TinyUSB 0.21 más correcciones posteriores, como usa upstream. El Pico SDK 2.3.1 sigue incluyendo la 0.18.0, que no tiene la forma de 4 argumentos de `TUD_AUDIO_EP_SIZE` que usa el `tusb_config.h` de este proyecto, y la compilación rechaza cualquier TinyUSB que no sea la 0.21:
    ```bash
    cd "$PICO_SDK_PATH/lib/tinyusb"
-   git fetch --depth 1 origin 2d56dc533e45e4e91b15e93fdab5e22e964f328d
+   git fetch --depth 1 origin 98741b55959564746998d0453c32d87064629d7c
    git checkout --detach FETCH_HEAD
    ```
 3. Configura y compila con CMake + Ninja (o Make):
    ```bash
    cd /path/to/DS5Dongle
-   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_PATH="$PICO_SDK_PATH"
+   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPICO_SDK_PATH="$PICO_SDK_PATH" -DENABLE_COMPANION_VENDOR=ON
    cmake --build build --target ds5-bridge
    ```
 4. El UF2 queda en `build/ds5-bridge-oled.uf2`. Flashéalo con BOOTSEL como siempre.
@@ -353,6 +353,19 @@ Opciones de compilación útiles:
 - `-DENABLE_BATT_LED=ON` (predeterminado): hace parpadear el LED de la Pico cuando la batería del DS5 está baja.
 - `-DENABLE_SERIAL=ON`: envía printf a USB CDC para depurar (OFF de forma predeterminada; libera el UART en las compilaciones de producción).
 - `-DPICO_W_BUILD=ON`: compila para la Pico W original (sin audio, reloj más bajo). De forma predeterminada se compila para la Pico 2 W.
+
+### Waveshare RP2350B-Plus-W
+
+La [Waveshare RP2350B-Plus-W](https://www.waveshare.com/wiki/RP2350B-Plus-W) utiliza un RP2350B, el módulo inalámbrico RM2 (el mismo chip CYW43 que la Pico 2 W), 16 MiB de flash QSPI y USB-C. Activa su perfil con `-DWAVESHARE_RP2350B_PLUS_W_BUILD=ON`. La opción está desactivada de forma predeterminada; la Pico 2 W sigue siendo el destino predeterminado. Usa un directorio de compilación nuevo y las versiones de las herramientas indicadas arriba:
+
+```bash
+cmake -S . -B build/waveshare -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DPICO_SDK_PATH="$PICO_SDK_PATH" -DWAVESHARE_RP2350B_PLUS_W_BUILD=ON \
+      -DENABLE_COMPANION_VENDOR=ON
+cmake --build build/waveshare --target ds5-bridge
+```
+
+El resultado es `build/waveshare/ds5-bridge-oled.uf2`. `ENABLE_COMPANION_VENDOR=ON` incluye la interfaz del configurador de escritorio. No combines la opción Waveshare con `PICO_W_BUILD=ON`. Consulta la [guía de la placa](boards/README.md) para el cableado OLED y las actualizaciones manuales del firmware Waveshare.
 
 ## Diagnóstico y herramientas de depuración
 

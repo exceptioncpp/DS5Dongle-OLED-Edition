@@ -2,7 +2,8 @@
 //
 // The lines live in flash as src/voice_bank.bin (tools/build_voice_bank.py):
 // Opus packets already encoded the way the DualSense's speaker takes them
-// (48 kHz stereo, 10 ms, CELT), stored compact and padded to the 0x39
+// (48 kHz stereo, 480-sample frames carrying 10.67 ms of her voice each, the
+// time the controller takes to play one; CELT), stored compact and padded to the 0x39
 // report's fixed frame size as they go out (opus_packet_pad). Nothing is
 // decoded or encoded here, so core1's speaker path is untouched: while a line
 // plays, its frames simply take the place of the host's speaker frames in the
@@ -40,7 +41,7 @@ extern "C" const uint8_t voice_bank_end[];
 namespace {
 constexpr uint32_t kHeader = 8;
 // A slot switch drops the controller after its line; never wait longer (the
-// longest slot line, 314 frames, plus its silence is 3.75 s).
+// longest slot line, 294 frames, plus its silence is 3.52 s).
 constexpr uint64_t kSlotLineMaxUs = 4500 * 1000;
 // Two frames per report, one report per 21.33 ms: the rate the host path
 // sends them and the controller plays them (it was 20 ms, 6.7 % fast, so a
@@ -139,6 +140,14 @@ bool voice_take_frames(uint8_t *frame0, uint8_t *frame1, uint16_t frame_size) {
     if (!voice_active()) return false;
     take_one(frame0, frame_size);
     take_one(frame1, frame_size);
+    return true;
+}
+
+// One frame, for the one-frame 0x36 report (packet_mode 1, protocol 1.22).
+bool voice_take_frame(uint8_t *frame, uint16_t frame_size) {
+    // error: NOT-WORTH — not a failure: false = no line playing, the caller keeps the PC's frame
+    if (!voice_active()) return false;
+    take_one(frame, frame_size);
     return true;
 }
 
